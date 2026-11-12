@@ -1,0 +1,984 @@
+<!DOCTYPE html>
+<html lang="zh-Hant-TW">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+  <meta name="theme-color" content="#0d9488" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-title" content="輕盈日誌" />
+  <title>輕盈日誌 — 個人減重與運動管理</title>
+  <script src="https://cdn.tailwindcss.com/3.4.17"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          fontFamily: {
+            sans: ['"PingFang TC"', '"Noto Sans TC"', '"Microsoft JhengHei"', 'system-ui', 'sans-serif']
+          }
+        }
+      }
+    };
+  </script>
+  <script src="https://cdn.jsdelivr.net/npm/dexie@4.0.10/dist/dexie.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+  <style>
+    body { padding-bottom: 84px; -webkit-tap-highlight-color: transparent; }
+    .safe-bottom { padding-bottom: env(safe-area-inset-bottom, 0px); }
+  </style>
+  <link rel="apple-touch-icon" href="./apple-touch-icon.png" />
+  <link rel="manifest" href="./manifest.json" />
+</head>
+<body class="bg-slate-50 text-slate-800 dark:bg-slate-950 dark:text-slate-100 antialiased">
+  <header class="sticky top-0 z-30 border-b border-slate-200/70 bg-white/90 px-4 py-3 backdrop-blur-md dark:border-slate-800 dark:bg-slate-900/90">
+    <div class="mx-auto flex max-w-3xl items-center justify-between">
+      <h1 class="text-lg font-extrabold tracking-tight text-teal-700 dark:text-teal-400">輕盈日誌</h1>
+      <span class="text-xs text-slate-400">IndexedDB 本機離線版</span>
+    </div>
+  </header>
+
+  <main id="app-main" class="mx-auto max-w-3xl px-4 py-4">
+    <div class="py-12 text-center text-sm text-slate-400">載入本機資料庫中…</div>
+  </main>
+
+  <nav class="fixed bottom-0 left-0 right-0 z-40 border-t border-slate-200 bg-white/95 backdrop-blur-md dark:border-slate-800 dark:bg-slate-900/95 safe-bottom">
+    <div id="bottom-nav" class="mx-auto flex max-w-3xl items-center justify-around px-1 py-1.5"></div>
+  </nav>
+
+  <div id="modal-root"></div>
+  <div id="toast-root" class="pointer-events-none fixed bottom-20 left-1/2 z-50 -translate-x-1/2"></div>
+
+  <script>
+    // ========= 1. 臺灣時間 (Asia/Taipei) 工具 =========
+    const TAIPEI_TZ = 'Asia/Taipei';
+    const WEEKDAY_NAMES = ['週日', '週一', '週二', '週三', '週四', '週五', '週六'];
+    const WEEKDAY_SHORT = ['日', '一', '二', '三', '四', '五', '六'];
+
+    function formatTaipeiDate(date) {
+      const parts = new Intl.DateTimeFormat('en-CA', {
+        timeZone: TAIPEI_TZ, year: 'numeric', month: '2-digit', day: '2-digit'
+      }).formatToParts(date);
+      const get = (t) => parts.find(p => p.type === t)?.value || '01';
+      return `${get('year')}-${get('month')}-${get('day')}`;
+    }
+    function getTaipeiToday() { return formatTaipeiDate(new Date()); }
+    function formatTaipeiFilenameTs() {
+      const parts = new Intl.DateTimeFormat('en-CA', {
+        timeZone: TAIPEI_TZ, year: 'numeric', month: '2-digit', day: '2-digit',
+        hour: '2-digit', minute: '2-digit', hour12: false
+      }).formatToParts(new Date());
+      const get = (t) => parts.find(p => p.type === t)?.value || '00';
+      return `${get('year')}-${get('month')}-${get('day')}-${get('hour')}${get('minute')}`;
+    }
+    function parseDateStr(s) { return new Date(`${s}T12:00:00+08:00`); }
+    function isValidDateStr(s) {
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return false;
+      const [y, m, d] = s.split('-').map(Number);
+      const dt = new Date(Date.UTC(y, m - 1, d));
+      return dt.getUTCFullYear() === y && dt.getUTCMonth() === m - 1 && dt.getUTCDate() === d;
+    }
+    function addDays(s, delta) {
+      const dt = parseDateStr(s);
+      dt.setUTCDate(dt.getUTCDate() + delta);
+      return formatTaipeiDate(dt);
+    }
+    function diffDays(a, b) {
+      return Math.round((parseDateStr(b).getTime() - parseDateStr(a).getTime()) / 86400000);
+    }
+    function getWeekday(s) {
+      const name = new Intl.DateTimeFormat('en-US', { timeZone: TAIPEI_TZ, weekday: 'short' }).format(parseDateStr(s));
+      return ({ Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 })[name] ?? 0;
+    }
+    function getWeekdayLabel(s) { return WEEKDAY_NAMES[getWeekday(s)]; }
+    function getWeekDates(anchor) {
+      const wd = getWeekday(anchor);
+      const mon = addDays(anchor, wd === 0 ? -6 : 1 - wd);
+      return Array.from({ length: 7 }, (_, i) => addDays(mon, i));
+    }
+    function getMonthDates(ym) {
+      const [y, m] = ym.split('-').map(Number);
+      const days = new Date(Date.UTC(y, m, 0)).getUTCDate();
+      return Array.from({ length: days }, (_, i) => `${ym}-${String(i + 1).padStart(2, '0')}`);
+    }
+    function round2(n) { return Math.round(n * 100) / 100; }
+    function escHtml(s) {
+      return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    }
+
+    // ========= 2. Dexie.js IndexedDB 資料庫 =========
+    const db = new Dexie('LightLogWeightTrackerDB');
+    db.version(1).stores({
+      settings: 'id',
+      weightLogs: 'id, &date',
+      mealLogs: 'id, &date',
+      exercisePlans: 'id, active',
+      exerciseOverrides: 'id, &date',
+      exerciseLogs: 'id, date, planId'
+    });
+
+    const DEFAULT_SETTINGS = {
+      id: 'main',
+      initialWeight: null,
+      targetWeight: null,
+      targetDate: null,
+      dailyCalorieTarget: 1800,
+      darkMode: false,
+      lastBackupConfirmedAt: null,
+      lastBackupGeneratedAt: null,
+      backupReminderDays: 7,
+      updatedAt: new Date().toISOString()
+    };
+
+    const DEFAULT_PLANS = [
+      { id: 'plan_stepper', name: '健身房踏步機', category: 'cardio', met: 7.0, defaultMinutes: 30, scheduleType: 'daily', weekdays: [0,1,2,3,4,5,6], weeklyFrequency: 7, active: true, createdAt: '2026-01-01T00:00:00.000Z', updatedAt: '2026-01-01T00:00:00.000Z' },
+      { id: 'plan_weights', name: '重量訓練', category: 'strength', met: 5.0, defaultMinutes: 60, scheduleType: 'weekly_days', weekdays: [2,5], weeklyFrequency: 2, active: true, createdAt: '2026-01-01T00:00:00.000Z', updatedAt: '2026-01-01T00:00:00.000Z' },
+      { id: 'plan_badminton', name: '羽球', category: 'sport', met: 5.5, defaultMinutes: 60, scheduleType: 'weekly_days', weekdays: [3,6], weeklyFrequency: 2, active: true, createdAt: '2026-01-01T00:00:00.000Z', updatedAt: '2026-01-01T00:00:00.000Z' }
+    ];
+
+    // ========= 3. 應用程式狀態 =========
+    const state = {
+      tab: 'dashboard',
+      selectedDate: getTaipeiToday(),
+      weightRange: '30',
+      showDailyLine: true,
+      showMa7Line: true,
+      showTargetLine: true,
+      expandedExKey: null,
+      settings: { ...DEFAULT_SETTINGS },
+      weightLogs: [],
+      mealLogs: [],
+      exercisePlans: [],
+      exerciseOverrides: [],
+      exerciseLogs: [],
+      persistStatus: { supported: false, persisted: false },
+      charts: {}
+    };
+
+    function showToast(msg) {
+      const root = document.getElementById('toast-root');
+      const el = document.createElement('div');
+      el.className = 'rounded-full bg-slate-900 px-4 py-2 text-xs font-medium text-white shadow-lg dark:bg-slate-100 dark:text-slate-900';
+      el.textContent = msg;
+      root.innerHTML = '';
+      root.appendChild(el);
+      setTimeout(() => { if (root.contains(el)) root.innerHTML = ''; }, 3000);
+    }
+
+    async function loadAllData() {
+      const [s, w, m, p, o, e] = await Promise.all([
+        db.settings.get('main'),
+        db.weightLogs.toArray(),
+        db.mealLogs.toArray(),
+        db.exercisePlans.toArray(),
+        db.exerciseOverrides.toArray(),
+        db.exerciseLogs.toArray()
+      ]);
+      if (s) state.settings = s;
+      state.weightLogs = w;
+      state.mealLogs = m;
+      state.exercisePlans = p;
+      state.exerciseOverrides = o;
+      state.exerciseLogs = e;
+      document.documentElement.classList.toggle('dark', !!state.settings.darkMode);
+    }
+
+    // ========= 4. 計算引擎 =========
+    function computeWeightStats() {
+      const today = getTaipeiToday();
+      const sorted = [...state.weightLogs].sort((a, b) => a.date.localeCompare(b.date));
+      const latest = sorted[sorted.length - 1] || null;
+      const prev = sorted[sorted.length - 2] || null;
+      const latestWeight = latest ? latest.weight : null;
+      const deltaFromPrevious = latest && prev ? round2(latest.weight - prev.weight) : null;
+      const remainingToTarget = latestWeight !== null && state.settings.targetWeight !== null ? round2(latestWeight - state.settings.targetWeight) : null;
+      const baseline = state.settings.initialWeight ?? (sorted[0]?.weight ?? null);
+      const totalLostKg = latestWeight !== null && baseline !== null ? round2(baseline - latestWeight) : null;
+      const totalLostPct = totalLostKg !== null && baseline > 0 ? round2((totalLostKg / baseline) * 100) : null;
+      const daysRemaining = state.settings.targetDate ? diffDays(today, state.settings.targetDate) : null;
+
+      const d7 = addDays(today, -6);
+      const r7 = sorted.filter(l => l.date >= d7 && l.date <= today);
+      const avg7Days = r7.length ? round2(r7.reduce((s, l) => s + l.weight, 0) / r7.length) : null;
+
+      const d30 = addDays(today, -30);
+      const r30 = sorted.filter(l => l.date >= d30 && l.date <= today);
+      const change30Days = r30.length >= 2 ? round2(r30[r30.length - 1].weight - r30[0].weight) : null;
+
+      let weeklyAvgChange = null;
+      if (sorted.length >= 2) {
+        const span = diffDays(sorted[0].date, sorted[sorted.length - 1].date);
+        if (span >= 1) weeklyAvgChange = round2(((sorted[sorted.length - 1].weight - sorted[0].weight) / span) * 7);
+      }
+      return { latestWeight, deltaFromPrevious, remainingToTarget, totalLostKg, totalLostPct, daysRemaining, avg7Days, change30Days, weeklyAvgChange, sorted };
+    }
+
+    function getScheduledPlansForDate(dateStr) {
+      const ov = state.exerciseOverrides.find(o => o.date === dateStr);
+      if (ov?.isRestDay) return [];
+      const active = state.exercisePlans.filter(p => p.active);
+      if (ov && Array.isArray(ov.customPlanIds)) {
+        const set = new Set(ov.customPlanIds);
+        return active.filter(p => set.has(p.id));
+      }
+      const wd = getWeekday(dateStr);
+      return active.filter(p => p.scheduleType === 'daily' || (p.scheduleType === 'weekly_days' && p.weekdays.includes(wd)));
+    }
+
+    function getCombinedExercises(dateStr) {
+      const scheduled = getScheduledPlansForDate(dateStr);
+      const dayLogs = state.exerciseLogs.filter(l => l.date === dateStr);
+      const list = scheduled.map(plan => {
+        const log = dayLogs.find(l => l.planId === plan.id);
+        return {
+          key: plan.id, plan, log,
+          name: log?.name ?? plan.name,
+          minutes: log?.actualMinutes ?? log?.plannedMinutes ?? plan.defaultMinutes,
+          completed: log?.completed ?? false,
+          calories: log?.caloriesBurned ?? null,
+          isEstimated: log?.caloriesIsEstimated ?? false
+        };
+      });
+      dayLogs.filter(l => l.isAdHoc || !scheduled.some(p => p.id === l.planId)).forEach(log => {
+        list.push({
+          key: log.id, plan: null, log, name: log.name,
+          minutes: log.actualMinutes ?? log.plannedMinutes,
+          completed: log.completed, calories: log.caloriesBurned, isEstimated: log.caloriesIsEstimated
+        });
+      });
+      return list;
+    }
+
+    function computeDailyCalorieSummary(dateStr) {
+      const mealLog = state.mealLogs.find(m => m.date === dateStr);
+      const exLogs = state.exerciseLogs.filter(l => l.date === dateStr && l.completed);
+      const target = mealLog?.targetCaloriesSnapshot ?? state.settings.dailyCalorieTarget;
+      const exerciseBurned = exLogs.reduce((s, l) => s + (l.caloriesBurned ?? 0), 0);
+      if (!mealLog) return { totalIntake: null, targetCalories: target, remainingQuota: null, exerciseBurned, netAfterExercise: null };
+      const vals = [mealLog.breakfast.calories, mealLog.lunch.calories, mealLog.dinner.calories, mealLog.other.calories]
+        .filter(v => v !== null && !Number.isNaN(v));
+      if (!vals.length) return { totalIntake: null, targetCalories: target, remainingQuota: null, exerciseBurned, netAfterExercise: null };
+      const totalIntake = vals.reduce((a, b) => a + b, 0);
+      return { totalIntake, targetCalories: target, remainingQuota: target - totalIntake, exerciseBurned, netAfterExercise: totalIntake - exerciseBurned };
+    }
+
+    function estimateMetCalories(met, weightKg, mins) {
+      const w = weightKg && weightKg > 0 ? weightKg : 65;
+      return Math.round(met * w * (mins / 60));
+    }
+
+    // ========= 5. 資料庫寫入操作 =========
+    async function saveWeight(date, weight, note = '') {
+      try {
+        const now = new Date().toISOString();
+        const existing = await db.weightLogs.get(`w_${date}`);
+        await db.transaction('rw', db.weightLogs, async () => {
+          await db.weightLogs.put({ id: `w_${date}`, date, weight, note, createdAt: existing?.createdAt ?? now, updatedAt: now });
+        });
+        await loadAllData();
+        render();
+        showToast('體重已儲存');
+      } catch (err) {
+        showToast('寫入失敗：' + (err.message || '儲存空間不足'));
+      }
+    }
+
+    async function saveMealField(date, mealKey, field, rawVal) {
+      try {
+        const existing = await db.mealLogs.get(`m_${date}`);
+        const base = existing || {
+          id: `m_${date}`, date, targetCaloriesSnapshot: state.settings.dailyCalorieTarget,
+          breakfast: { food: '', calories: null }, lunch: { food: '', calories: null },
+          dinner: { food: '', calories: null }, other: { food: '', calories: null }, updatedAt: new Date().toISOString()
+        };
+        const nextEntry = { ...base[mealKey] };
+        if (field === 'food') nextEntry.food = rawVal;
+        else nextEntry.calories = rawVal.trim() === '' ? null : Math.max(0, Math.round(Number(rawVal)));
+        base[mealKey] = nextEntry;
+        base.updatedAt = new Date().toISOString();
+        await db.transaction('rw', db.mealLogs, async () => { await db.mealLogs.put(base); });
+        await loadAllData();
+        render();
+        showToast('飲食紀錄已儲存');
+      } catch (err) {
+        showToast('寫入失敗：' + err.message);
+      }
+    }
+
+    async function toggleExerciseItem(date, key, updates) {
+      try {
+        const items = getCombinedExercises(date);
+        const target = items.find(i => i.key === key);
+        if (!target) return;
+        const now = new Date().toISOString();
+        const id = target.log?.id ?? `ex_${date}_${target.plan.id}`;
+        const record = {
+          id, date,
+          planId: target.log?.planId ?? target.plan?.id ?? null,
+          name: target.log?.name ?? target.plan?.name ?? '運動',
+          met: target.log?.met ?? target.plan?.met ?? 5.0,
+          plannedMinutes: target.log?.plannedMinutes ?? target.plan?.defaultMinutes ?? 30,
+          actualMinutes: target.log?.actualMinutes ?? target.plan?.defaultMinutes ?? 30,
+          completed: target.log?.completed ?? false,
+          caloriesBurned: target.log?.caloriesBurned ?? null,
+          caloriesIsEstimated: target.log?.caloriesIsEstimated ?? false,
+          note: target.log?.note ?? '',
+          isAdHoc: target.log?.isAdHoc ?? !target.plan,
+          createdAt: target.log?.createdAt ?? now,
+          updatedAt: now,
+          ...updates
+        };
+        await db.transaction('rw', db.exerciseLogs, async () => { await db.exerciseLogs.put(record); });
+        await loadAllData();
+        render();
+        showToast('運動紀錄已儲存');
+      } catch (err) {
+        showToast('寫入失敗：' + err.message);
+      }
+    }
+
+    // ========= 6. 頁面渲染 =========
+    function destroyCharts() {
+      Object.values(state.charts).forEach(c => c?.destroy());
+      state.charts = {};
+    }
+
+    function renderBottomNav() {
+      const items = [
+        { id: 'dashboard', label: '今日', icon: '🏠' },
+        { id: 'weight', label: '體重', icon: '📈' },
+        { id: 'exercise', label: '運動', icon: '🏃' },
+        { id: 'diet', label: '飲食', icon: '🍽️' },
+        { id: 'settings', label: '設定', icon: '⚙️' }
+      ];
+      document.getElementById('bottom-nav').innerHTML = items.map(it => `
+        <button type="button" data-nav="${it.id}" class="flex min-w-[60px] flex-col items-center rounded-xl px-2 py-1.5 text-xs font-medium ${state.tab === it.id ? 'text-teal-600 dark:text-teal-400 font-bold' : 'text-slate-500 dark:text-slate-400'}">
+          <span class="text-base leading-none mb-1">${it.icon}</span>
+          <span>${it.label}</span>
+        </button>
+      `).join('');
+      document.querySelectorAll('[data-nav]').forEach(btn => {
+        btn.addEventListener('click', () => { state.tab = btn.dataset.nav; render(); });
+      });
+    }
+
+    function renderDashboard(main) {
+      const today = getTaipeiToday();
+      const d = state.selectedDate;
+      const wStats = computeWeightStats();
+      const wLog = state.weightLogs.find(w => w.date === d);
+      const mLog = state.mealLogs.find(m => m.date === d);
+      const exItems = getCombinedExercises(d);
+      const cal = computeDailyCalorieSummary(d);
+      const isOver = cal.remainingQuota !== null && cal.remainingQuota < 0;
+      const ratio = cal.totalIntake !== null && cal.targetCalories > 0 ? Math.min(100, Math.round((cal.totalIntake / cal.targetCalories) * 100)) : 0;
+
+      const daysSinceBackup = state.settings.lastBackupConfirmedAt
+        ? diffDays(state.settings.lastBackupConfirmedAt.slice(0, 10), today) : null;
+      const needReminder = daysSinceBackup === null
+        ? (state.weightLogs.length + state.mealLogs.length + state.exerciseLogs.length >= 3)
+        : daysSinceBackup >= state.settings.backupReminderDays;
+
+      main.innerHTML = `
+        <div class="space-y-4">
+          ${needReminder ? `
+            <div class="flex items-center justify-between gap-3 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-xs text-amber-900 dark:border-amber-800 dark:bg-amber-950/50 dark:text-amber-200">
+              <span>${daysSinceBackup === null ? '建議定期匯出 JSON 備份，確保本機資料安全。' : `距離上次確認備份已過 ${daysSinceBackup} 天，建議匯出備份。`}</span>
+              <button type="button" id="btn-go-backup" class="shrink-0 rounded-xl bg-amber-600 px-3 py-1.5 font-semibold text-white">前往備份</button>
+            </div>` : ''}
+
+          <section class="rounded-3xl border border-slate-200/80 bg-white p-5 shadow-sm dark:border-slate-800 dark:bg-slate-900">
+            <div class="mb-3 flex items-center justify-between">
+              <div>
+                <p class="text-xs font-medium text-teal-600 dark:text-teal-400">${d === today ? '今天' : '歷史檢視 / 補登'}</p>
+                <h2 class="text-lg font-bold">${d.replace(/-/g, '/')} ${getWeekdayLabel(d)}</h2>
+              </div>
+              <input type="date" id="dash-date" value="${d}" max="${today}" class="rounded-xl border border-slate-200 bg-slate-50 px-2.5 py-1.5 text-xs dark:border-slate-700 dark:bg-slate-800" />
+            </div>
+            <div class="flex items-end justify-between gap-4">
+              <div>
+                <span class="text-xs text-slate-500">空腹體重</span>
+                <div class="mt-0.5 flex items-baseline gap-2">
+                  <span class="text-3xl font-extrabold">${wLog ? wLog.weight.toFixed(2) : '--'}</span>
+                  <span class="text-sm text-slate-500">kg</span>
+                </div>
+                <div class="mt-1.5 flex flex-wrap gap-3 text-xs text-slate-500">
+                  <span>較上筆：${wStats.deltaFromPrevious !== null ? (wStats.deltaFromPrevious > 0 ? '+' : '') + wStats.deltaFromPrevious.toFixed(2) + ' kg' : '尚無對比'}</span>
+                  <span>距目標：${wStats.remainingToTarget !== null ? (wStats.remainingToTarget > 0 ? '還差 ' : '已超越 ') + Math.abs(wStats.remainingToTarget).toFixed(2) + ' kg' : '未設定'}</span>
+                </div>
+              </div>
+              <button type="button" id="btn-toggle-w" class="rounded-2xl bg-teal-600 px-4 py-2.5 text-sm font-semibold text-white">${wLog ? '修改體重' : '快速輸入'}</button>
+            </div>
+            <form id="dash-w-form" class="mt-4 hidden gap-2">
+              <input type="number" id="dash-w-input" inputmode="decimal" step="0.01" placeholder="例如 68.45" value="${wLog ? wLog.weight : ''}" class="w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-base dark:border-slate-700 dark:bg-slate-800" />
+              <button type="submit" class="shrink-0 rounded-xl bg-teal-600 px-4 py-2 text-sm font-semibold text-white">儲存</button>
+            </form>
+          </section>
+
+          <section class="rounded-3xl border border-slate-200/80 bg-white p-5 shadow-sm dark:border-slate-800 dark:bg-slate-900">
+            <div class="mb-3 flex items-center justify-between">
+              <h3 class="font-bold">今日熱量管理</h3>
+              <span class="text-xs text-slate-500">目標 ${cal.targetCalories} kcal</span>
+            </div>
+            <div class="grid grid-cols-2 gap-3 sm:grid-cols-4">
+              <div class="rounded-2xl bg-slate-50 p-3 dark:bg-slate-800/70"><div class="text-xs text-slate-500">今日攝取</div><div class="mt-1 text-xl font-bold">${cal.totalIntake !== null ? cal.totalIntake : '未記錄'}</div></div>
+              <div class="rounded-2xl p-3 ${isOver ? 'bg-amber-50 dark:bg-amber-950/40' : 'bg-teal-50/70 dark:bg-teal-950/40'}"><div class="text-xs text-slate-500">剩餘攝取額度</div><div class="mt-1 text-xl font-bold ${isOver ? 'text-amber-700 dark:text-amber-300' : 'text-teal-700 dark:text-teal-300'}">${cal.remainingQuota !== null ? cal.remainingQuota : '未記錄'}</div></div>
+              <div class="rounded-2xl bg-slate-50 p-3 dark:bg-slate-800/70"><div class="text-xs text-slate-500">運動消耗</div><div class="mt-1 text-xl font-bold">${cal.exerciseBurned}</div></div>
+              <div class="rounded-2xl bg-slate-50 p-3 dark:bg-slate-800/70"><div class="text-xs text-slate-500">攝取−運動差額</div><div class="mt-1 text-xl font-bold">${cal.netAfterExercise !== null ? cal.netAfterExercise : '未記錄'}</div></div>
+            </div>
+            <div class="mt-3">
+              <div class="h-2.5 w-full overflow-hidden rounded-full bg-slate-100 dark:bg-slate-800"><div class="h-full rounded-full ${isOver ? 'bg-amber-500' : 'bg-teal-500'}" style="width:${ratio}%"></div></div>
+              <p class="mt-2 text-[11px] text-slate-500">${isOver ? '今日攝取已略高於設定目標，明天再穩健調整即可。' : '註：「攝取−運動差額」未計入基礎代謝與日常活動，不等於實際熱量盈餘或赤字；運動消耗亦不建議全數吃回。'}</p>
+            </div>
+          </section>
+
+          <section class="rounded-3xl border border-slate-200/80 bg-white p-5 shadow-sm dark:border-slate-800 dark:bg-slate-900">
+            <div class="mb-3 flex items-center justify-between">
+              <h3 class="font-bold">今日運動清單</h3>
+              <span class="text-xs text-slate-500">已完成 ${exItems.filter(e => e.completed).length} / ${exItems.length}</span>
+            </div>
+            ${exItems.length === 0 ? `<p class="rounded-2xl bg-slate-50 p-4 text-center text-sm text-slate-500 dark:bg-slate-800/50">今日未排定運動或設為休息日</p>` : `
+              <div class="space-y-2.5">
+                ${exItems.map(item => `
+                  <div class="rounded-2xl border border-slate-100 bg-slate-50/70 p-3 dark:border-slate-800 dark:bg-slate-800/50">
+                    <div class="flex items-center justify-between gap-2">
+                      <button type="button" data-ex-toggle="${item.key}" class="flex flex-1 items-center gap-2.5 text-left">
+                        <span class="text-lg">${item.completed ? '✅' : '⬜'}</span>
+                        <div>
+                          <div class="font-semibold ${item.completed ? 'line-through text-slate-400' : ''}">${escHtml(item.name)}</div>
+                          <div class="text-xs text-slate-500">${item.minutes} 分鐘${item.calories !== null ? ` • ${item.calories} kcal${item.isEstimated ? ' (估算值)' : ''}` : ''}</div>
+                        </div>
+                      </button>
+                      <button type="button" data-ex-expand="${item.key}" class="rounded-xl px-2.5 py-1 text-xs font-medium text-teal-600">${state.expandedExKey === item.key ? '收合' : '調整'}</button>
+                    </div>
+                    ${state.expandedExKey === item.key ? `
+                      <div class="mt-3 grid grid-cols-2 gap-2 border-t border-slate-200/70 pt-3 text-xs dark:border-slate-700">
+                        <label>實際分鐘數<input type="number" inputmode="numeric" data-ex-min="${item.key}" value="${item.minutes}" class="mt-1 w-full rounded-xl border border-slate-200 bg-white px-2.5 py-1.5 dark:border-slate-700 dark:bg-slate-900" /></label>
+                        <label>消耗熱量 (kcal)
+                          <div class="mt-1 flex gap-1">
+                            <input type="number" inputmode="numeric" data-ex-cal="${item.key}" value="${item.calories ?? ''}" placeholder="手動或估算" class="w-full rounded-xl border border-slate-200 bg-white px-2.5 py-1.5 dark:border-slate-700 dark:bg-slate-900" />
+                            <button type="button" data-ex-est="${item.key}" class="shrink-0 rounded-xl bg-slate-200 px-2 py-1.5 font-medium dark:bg-slate-700">估算</button>
+                          </div>
+                        </label>
+                      </div>
+                    ` : ''}
+                  </div>
+                `).join('')}
+              </div>
+            `}
+          </section>
+
+          <section class="space-y-2.5">
+            <h3 class="px-1 font-bold">今日三餐快速紀錄</h3>
+            ${[['breakfast','早餐'],['lunch','午餐'],['dinner','晚餐'],['other','其他飲食 (選填)']].map(([k, label]) => {
+              const entry = mLog?.[k];
+              return `
+                <div class="rounded-2xl border border-slate-200/80 bg-white p-3.5 shadow-sm dark:border-slate-800 dark:bg-slate-900">
+                  <div class="mb-2 flex items-center justify-between"><span class="text-sm font-bold">${label}</span><span class="text-xs text-slate-500">${entry?.calories !== null && entry?.calories !== undefined ? entry.calories + ' kcal' : '未記錄'}</span></div>
+                  <div class="flex gap-2">
+                    <input type="text" data-meal-food="${k}" value="${escHtml(entry?.food ?? '')}" placeholder="吃了什麼？" class="flex-1 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-800" />
+                    <input type="number" inputmode="numeric" data-meal-cal="${k}" value="${entry?.calories ?? ''}" placeholder="kcal" class="w-24 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-right text-sm dark:border-slate-700 dark:bg-slate-800" />
+                  </div>
+                </div>
+              `;
+            }).join('')}
+          </section>
+
+          <button type="button" id="btn-open-checkin" class="w-full rounded-2xl bg-gradient-to-r from-teal-600 to-emerald-600 px-5 py-4 text-base font-bold text-white shadow-md">
+            🖼️ 產生今日打卡圖片
+          </button>
+        </div>
+      `;
+
+      document.getElementById('btn-go-backup')?.addEventListener('click', () => { state.tab = 'settings'; render(); });
+      document.getElementById('dash-date').addEventListener('change', (e) => { if (e.target.value) { state.selectedDate = e.target.value; render(); } });
+      document.getElementById('btn-toggle-w').addEventListener('click', () => {
+        const f = document.getElementById('dash-w-form');
+        f.classList.toggle('hidden'); f.classList.toggle('flex');
+      });
+      document.getElementById('dash-w-form').addEventListener('submit', (e) => {
+        e.preventDefault();
+        const val = parseFloat(document.getElementById('dash-w-input').value);
+        if (Number.isNaN(val) || val < 20 || val > 300) return showToast('請輸入有效體重 (20–300 kg)');
+        saveWeight(d, round2(val));
+      });
+      document.querySelectorAll('[data-ex-toggle]').forEach(btn => btn.addEventListener('click', () => {
+        const key = btn.dataset.exToggle;
+        const cur = exItems.find(x => x.key === key);
+        toggleExerciseItem(d, key, { completed: !cur.completed });
+      }));
+      document.querySelectorAll('[data-ex-expand]').forEach(btn => btn.addEventListener('click', () => {
+        const key = btn.dataset.exExpand;
+        state.expandedExKey = state.expandedExKey === key ? null : key;
+        render();
+      }));
+      document.querySelectorAll('[data-ex-min]').forEach(inp => inp.addEventListener('change', (e) => {
+        toggleExerciseItem(d, inp.dataset.exMin, { actualMinutes: Math.max(0, Number(e.target.value) || 0) });
+      }));
+      document.querySelectorAll('[data-ex-cal]').forEach(inp => inp.addEventListener('change', (e) => {
+        const raw = e.target.value.trim();
+        toggleExerciseItem(d, inp.dataset.exCal, { caloriesBurned: raw === '' ? null : Math.max(0, Number(raw)), caloriesIsEstimated: false });
+      }));
+      document.querySelectorAll('[data-ex-est]').forEach(btn => btn.addEventListener('click', () => {
+        const cur = exItems.find(x => x.key === btn.dataset.exEst);
+        const met = cur.plan?.met ?? cur.log?.met ?? 5.0;
+        const est = estimateMetCalories(met, wStats.latestWeight, cur.minutes);
+        toggleExerciseItem(d, btn.dataset.exEst, { caloriesBurned: est, caloriesIsEstimated: true });
+      }));
+      document.querySelectorAll('[data-meal-food]').forEach(inp => inp.addEventListener('change', (e) => saveMealField(d, inp.dataset.mealFood, 'food', e.target.value)));
+      document.querySelectorAll('[data-meal-cal]').forEach(inp => inp.addEventListener('change', (e) => saveMealField(d, inp.dataset.mealCal, 'calories', e.target.value)));
+      document.getElementById('btn-open-checkin').addEventListener('click', () => openCheckinModal(d));
+    }
+
+    function renderWeightView(main) {
+      const today = getTaipeiToday();
+      const s = computeWeightStats();
+      const cutoff = state.weightRange === 'all' ? '0000-00-00' : addDays(today, -(Number(state.weightRange) - 1));
+      const ma7All = s.sorted.map(item => {
+        const minD = addDays(item.date, -6);
+        const win = s.sorted.filter(l => l.date >= minD && l.date <= item.date);
+        return round2(win.reduce((sum, l) => sum + l.weight, 0) / win.length);
+      });
+      const filtered = s.sorted.map((l, idx) => ({ l, ma7: ma7All[idx] })).filter(x => x.l.date >= cutoff);
+
+      main.innerHTML = `
+        <div class="space-y-4">
+          <section class="grid grid-cols-2 gap-3 sm:grid-cols-3">
+            <div class="rounded-2xl border border-slate-200/80 bg-white p-3.5 dark:border-slate-800 dark:bg-slate-900"><div class="text-xs text-slate-500">目前 / 目標</div><div class="mt-1 text-lg font-bold">${s.latestWeight !== null ? s.latestWeight.toFixed(2) + ' kg' : '--'} <span class="text-xs font-normal text-slate-400">/ ${state.settings.targetWeight ?? '未設'}</span></div></div>
+            <div class="rounded-2xl border border-slate-200/80 bg-white p-3.5 dark:border-slate-800 dark:bg-slate-900"><div class="text-xs text-slate-500">累計減重</div><div class="mt-1 text-lg font-bold text-teal-600">${s.totalLostKg !== null ? (s.totalLostKg > 0 ? '-' : '+') + Math.abs(s.totalLostKg).toFixed(2) + ' kg' : '--'} ${s.totalLostPct !== null ? `(${s.totalLostPct}%)` : ''}</div></div>
+            <div class="rounded-2xl border border-slate-200/80 bg-white p-3.5 dark:border-slate-800 dark:bg-slate-900"><div class="text-xs text-slate-500">距離目標日</div><div class="mt-1 text-lg font-bold">${s.daysRemaining !== null ? (s.daysRemaining >= 0 ? `剩 ${s.daysRemaining} 天` : `已過 ${Math.abs(s.daysRemaining)} 天`) : '未設定'}</div></div>
+            <div class="rounded-2xl border border-slate-200/80 bg-white p-3.5 dark:border-slate-800 dark:bg-slate-900"><div class="text-xs text-slate-500">近 7 天平均</div><div class="mt-1 text-lg font-bold">${s.avg7Days !== null ? s.avg7Days.toFixed(2) + ' kg' : '--'}</div></div>
+            <div class="rounded-2xl border border-slate-200/80 bg-white p-3.5 dark:border-slate-800 dark:bg-slate-900"><div class="text-xs text-slate-500">近 30 天變化</div><div class="mt-1 text-lg font-bold">${s.change30Days !== null ? (s.change30Days > 0 ? '+' : '') + s.change30Days.toFixed(2) + ' kg' : '--'}</div></div>
+            <div class="rounded-2xl border border-slate-200/80 bg-white p-3.5 dark:border-slate-800 dark:bg-slate-900"><div class="text-xs text-slate-500">每週平均變化</div><div class="mt-1 text-lg font-bold">${s.weeklyAvgChange !== null ? (s.weeklyAvgChange > 0 ? '+' : '') + s.weeklyAvgChange.toFixed(2) + ' kg' : '--'}</div></div>
+          </section>
+
+          <section class="rounded-3xl border border-slate-200/80 bg-white p-4 shadow-sm dark:border-slate-800 dark:bg-slate-900">
+            <div class="mb-3 flex flex-wrap items-center justify-between gap-2">
+              <h3 class="font-bold">體重趨勢圖</h3>
+              <div class="flex rounded-xl bg-slate-100 p-1 text-xs dark:bg-slate-800">
+                ${[['7','7天'],['30','30天'],['90','90天'],['all','全部']].map(([v,lbl]) => `
+                  <button type="button" data-wrange="${v}" class="rounded-lg px-2.5 py-1 font-medium ${state.weightRange === v ? 'bg-white text-teal-700 shadow-sm dark:bg-slate-700 dark:text-teal-300' : 'text-slate-500'}">${lbl}</button>
+                `).join('')}
+              </div>
+            </div>
+            ${filtered.length === 0 ? `<div class="flex h-56 items-center justify-center rounded-2xl bg-slate-50 text-sm text-slate-400 dark:bg-slate-800/50">尚無體重紀錄，請於下方新增</div>` : `<div class="relative h-64"><canvas id="weight-chart"></canvas></div>`}
+          </section>
+
+          <section class="rounded-3xl border border-slate-200/80 bg-white p-4 shadow-sm dark:border-slate-800 dark:bg-slate-900">
+            <h3 class="mb-3 font-bold">新增或補登體重</h3>
+            <form id="w-add-form" class="space-y-3">
+              <div class="grid grid-cols-2 gap-2.5">
+                <label class="text-xs">日期<input type="date" id="w-f-date" value="${today}" max="${today}" class="mt-1 w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-800" /></label>
+                <label class="text-xs">體重 (kg)<input type="number" id="w-f-val" inputmode="decimal" step="0.01" placeholder="68.25" class="mt-1 w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-800" /></label>
+              </div>
+              <div class="flex gap-2">
+                <input type="text" id="w-f-note" placeholder="備註（選填）" class="flex-1 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-800" />
+                <button type="submit" class="rounded-xl bg-teal-600 px-4 py-2 text-sm font-semibold text-white">儲存</button>
+              </div>
+            </form>
+          </section>
+
+          <section class="rounded-3xl border border-slate-200/80 bg-white p-4 shadow-sm dark:border-slate-800 dark:bg-slate-900">
+            <h3 class="mb-2 font-bold">歷史紀錄 (${s.sorted.length} 筆)</h3>
+            <div class="divide-y divide-slate-100 dark:divide-slate-800">
+              ${[...s.sorted].reverse().map(it => `
+                <div class="flex items-center justify-between py-2.5 text-sm">
+                  <div><span class="font-semibold">${it.date.replace(/-/g,'/')}</span><span class="ml-3 font-bold text-teal-600">${it.weight.toFixed(2)} kg</span></div>
+                  <button type="button" data-w-del="${it.id}" class="text-xs text-rose-500">刪除</button>
+                </div>
+              `).join('') || '<p class="py-4 text-center text-xs text-slate-400">尚無紀錄</p>'}
+            </div>
+          </section>
+        </div>
+      `;
+
+      document.querySelectorAll('[data-wrange]').forEach(b => b.addEventListener('click', () => { state.weightRange = b.dataset.wrange; render(); }));
+      document.getElementById('w-add-form').addEventListener('submit', (e) => {
+        e.preventDefault();
+        const dt = document.getElementById('w-f-date').value;
+        const val = parseFloat(document.getElementById('w-f-val').value);
+        const note = document.getElementById('w-f-note').value.trim();
+        if (Number.isNaN(val) || val < 20 || val > 300) return showToast('請輸入有效體重 (20–300 kg)');
+        saveWeight(dt, round2(val), note);
+      });
+      document.querySelectorAll('[data-w-del]').forEach(b => b.addEventListener('click', async () => {
+        await db.weightLogs.delete(b.dataset.wDel);
+        await loadAllData(); render(); showToast('已刪除體重紀錄');
+      }));
+
+      if (filtered.length > 0 && document.getElementById('weight-chart')) {
+        const datasets = [
+          { label: '每日體重 (kg)', data: filtered.map(x => x.l.weight), borderColor: '#0d9488', tension: 0.25 },
+          { label: '7 日移動平均', data: filtered.map(x => x.ma7), borderColor: '#f59e0b', borderDash: [4, 4], pointRadius: 0 }
+        ];
+        if (state.settings.targetWeight !== null) {
+          datasets.push({ label: '目標體重', data: filtered.map(() => state.settings.targetWeight), borderColor: '#64748b', borderDash: [6, 6], pointRadius: 0, borderWidth: 1.5 });
+        }
+        state.charts.weight = new Chart(document.getElementById('weight-chart'), {
+          type: 'line',
+          data: { labels: filtered.map(x => x.l.date.slice(5).replace('-', '/')), datasets },
+          options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { position: 'bottom' } } }
+        });
+      }
+    }
+
+    function renderExerciseView(main) {
+      const today = getTaipeiToday();
+      const weekDates = getWeekDates(today);
+      let scheduledUpToToday = 0, completedCount = 0, totalMins = 0, totalCals = 0;
+      weekDates.forEach(d => {
+        if (d <= today) scheduledUpToToday += getScheduledPlansForDate(d).length;
+        state.exerciseLogs.filter(l => l.date === d && l.completed).forEach(l => {
+          completedCount++; totalMins += l.actualMinutes ?? l.plannedMinutes ?? 0; totalCals += l.caloriesBurned ?? 0;
+        });
+      });
+      const rate = scheduledUpToToday > 0 ? Math.min(100, Math.round((completedCount / scheduledUpToToday) * 100)) : null;
+
+      main.innerHTML = `
+        <div class="space-y-4">
+          <section class="grid grid-cols-2 gap-3 sm:grid-cols-4">
+            <div class="rounded-2xl border border-slate-200/80 bg-white p-3.5 dark:border-slate-800 dark:bg-slate-900"><div class="text-xs text-slate-500">本週完成 / 應完成</div><div class="mt-1 text-lg font-bold">${completedCount} / ${scheduledUpToToday} 次</div></div>
+            <div class="rounded-2xl border border-slate-200/80 bg-white p-3.5 dark:border-slate-800 dark:bg-slate-900"><div class="text-xs text-slate-500">本週完成率</div><div class="mt-1 text-lg font-bold text-teal-600">${rate !== null ? rate + '%' : '--'}</div></div>
+            <div class="rounded-2xl border border-slate-200/80 bg-white p-3.5 dark:border-slate-800 dark:bg-slate-900"><div class="text-xs text-slate-500">本週總分鐘數</div><div class="mt-1 text-lg font-bold">${totalMins} 分</div></div>
+            <div class="rounded-2xl border border-slate-200/80 bg-white p-3.5 dark:border-slate-800 dark:bg-slate-900"><div class="text-xs text-slate-500">本週運動消耗</div><div class="mt-1 text-lg font-bold">${totalCals} kcal</div></div>
+          </section>
+
+          <section class="rounded-3xl border border-slate-200/80 bg-white p-4 shadow-sm dark:border-slate-800 dark:bg-slate-900">
+            <h3 class="mb-3 font-bold">固定運動排程設定</h3>
+            <div class="space-y-3">
+              ${state.exercisePlans.map(p => `
+                <div class="rounded-2xl bg-slate-50 p-3 dark:bg-slate-800/60">
+                  <div class="mb-2 flex items-center justify-between">
+                    <div><span class="font-bold">${escHtml(p.name)}</span> <span class="text-xs text-slate-500">MET ${p.met} • ${p.defaultMinutes} 分鐘</span></div>
+                    <button type="button" data-plan-del="${p.id}" class="text-xs text-rose-500">移除</button>
+                  </div>
+                  <div class="flex flex-wrap gap-1.5">
+                    ${[1,2,3,4,5,6,0].map(wd => `
+                      <button type="button" data-plan-wd="${p.id}:${wd}" class="h-8 w-8 rounded-full text-xs font-semibold ${p.weekdays.includes(wd) ? 'bg-teal-600 text-white' : 'bg-white text-slate-500 dark:bg-slate-900'}">${WEEKDAY_SHORT[wd]}</button>
+                    `).join('')}
+                  </div>
+                </div>
+              `).join('')}
+            </div>
+            <form id="plan-add-form" class="mt-4 flex gap-2 border-t border-slate-100 pt-3 dark:border-slate-800">
+              <input type="text" id="plan-new-name" placeholder="新增運動項目（如慢跑）" class="flex-1 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-800" />
+              <input type="number" id="plan-new-min" inputmode="numeric" value="30" class="w-16 rounded-xl border border-slate-200 bg-slate-50 px-2 py-2 text-center text-sm dark:border-slate-700 dark:bg-slate-800" />
+              <button type="submit" class="rounded-xl bg-teal-600 px-3.5 py-2 text-sm font-semibold text-white">新增</button>
+            </form>
+          </section>
+
+          <section class="rounded-3xl border border-slate-200/80 bg-white p-4 shadow-sm dark:border-slate-800 dark:bg-slate-900">
+            <h3 class="mb-3 font-bold">近 4 週運動分鐘數</h3>
+            <div class="relative h-52"><canvas id="ex-bar-chart"></canvas></div>
+          </section>
+        </div>
+      `;
+
+      document.querySelectorAll('[data-plan-wd]').forEach(btn => btn.addEventListener('click', async () => {
+        const [pid, wdStr] = btn.dataset.planWd.split(':');
+        const wd = Number(wdStr);
+        const plan = state.exercisePlans.find(p => p.id === pid);
+        if (!plan) return;
+        const nextDays = plan.weekdays.includes(wd) ? plan.weekdays.filter(x => x !== wd) : [...plan.weekdays, wd].sort();
+        await db.exercisePlans.put({ ...plan, scheduleType: nextDays.length === 7 ? 'daily' : 'weekly_days', weekdays: nextDays, weeklyFrequency: nextDays.length, updatedAt: new Date().toISOString() });
+        await loadAllData(); render(); showToast('排程已更新');
+      }));
+      document.querySelectorAll('[data-plan-del]').forEach(btn => btn.addEventListener('click', async () => {
+        await db.exercisePlans.delete(btn.dataset.planDel);
+        await loadAllData(); render(); showToast('已移除排程（過去紀錄仍保留）');
+      }));
+      document.getElementById('plan-add-form').addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const name = document.getElementById('plan-new-name').value.trim();
+        if (!name) return;
+        const mins = Math.max(5, Number(document.getElementById('plan-new-min').value) || 30);
+        const now = new Date().toISOString();
+        await db.exercisePlans.put({ id: `plan_${Date.now()}`, name, category: 'other', met: 5.5, defaultMinutes: mins, scheduleType: 'weekly_days', weekdays: [1,4], weeklyFrequency: 2, active: true, createdAt: now, updatedAt: now });
+        await loadAllData(); render(); showToast('已新增運動項目');
+      });
+
+      const barLabels = [], barData = [];
+      for (let w = 3; w >= 0; w--) {
+        const wd = getWeekDates(addDays(today, -w * 7));
+        barLabels.push(wd[0].slice(5).replace('-', '/'));
+        barData.push(state.exerciseLogs.filter(l => l.completed && wd.includes(l.date)).reduce((s, l) => s + (l.actualMinutes ?? l.plannedMinutes ?? 0), 0));
+      }
+      state.charts.ex = new Chart(document.getElementById('ex-bar-chart'), {
+        type: 'bar',
+        data: { labels: barLabels, datasets: [{ label: '分鐘數', data: barData, backgroundColor: '#0d9488', borderRadius: 8 }] },
+        options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } } }
+      });
+    }
+
+    function renderDietView(main) {
+      const d = state.selectedDate;
+      const today = getTaipeiToday();
+      const mLog = state.mealLogs.find(m => m.date === d);
+      const cal = computeDailyCalorieSummary(d);
+
+      main.innerHTML = `
+        <div class="space-y-4">
+          <section class="flex items-center justify-between rounded-2xl border border-slate-200/80 bg-white p-4 dark:border-slate-800 dark:bg-slate-900">
+            <div><div class="text-xs text-slate-500">飲食紀錄日期</div><div class="font-bold">${d.replace(/-/g,'/')} ${getWeekdayLabel(d)}</div></div>
+            <input type="date" id="diet-date" value="${d}" max="${today}" class="rounded-xl border border-slate-200 bg-slate-50 px-3 py-1.5 text-xs dark:border-slate-700 dark:bg-slate-800" />
+          </section>
+          <section class="grid grid-cols-2 gap-3">
+            <div class="rounded-2xl border border-slate-200/80 bg-white p-3.5 dark:border-slate-800 dark:bg-slate-900"><div class="text-xs text-slate-500">當日總攝取</div><div class="mt-1 text-lg font-bold">${cal.totalIntake !== null ? cal.totalIntake + ' kcal' : '未記錄'}</div></div>
+            <div class="rounded-2xl border border-slate-200/80 bg-white p-3.5 dark:border-slate-800 dark:bg-slate-900"><div class="text-xs text-slate-500">剩餘額度</div><div class="mt-1 text-lg font-bold text-teal-600">${cal.remainingQuota !== null ? cal.remainingQuota + ' kcal' : '未記錄'}</div></div>
+          </section>
+          ${[['breakfast','早餐'],['lunch','午餐'],['dinner','晚餐'],['other','其他飲食（選填）']].map(([k, lbl]) => {
+            const entry = mLog?.[k];
+            return `
+              <div class="rounded-3xl border border-slate-200/80 bg-white p-4 shadow-sm dark:border-slate-800 dark:bg-slate-900">
+                <div class="mb-2 flex justify-between"><span class="font-bold">${lbl}</span><span class="text-xs text-slate-500">${entry?.calories !== null && entry?.calories !== undefined ? entry.calories + ' kcal' : '未記錄'}</span></div>
+                <textarea rows="2" data-dfood="${k}" placeholder="自由輸入吃了什麼" class="mb-2 w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-800">${escHtml(entry?.food ?? '')}</textarea>
+                <div class="flex items-center justify-end gap-2 text-xs"><span>熱量 (kcal)：</span><input type="number" inputmode="numeric" data-dcal="${k}" value="${entry?.calories ?? ''}" placeholder="未記錄" class="w-28 rounded-xl border border-slate-200 bg-slate-50 px-3 py-1.5 text-right text-sm dark:border-slate-700 dark:bg-slate-800" /></div>
+              </div>
+            `;
+          }).join('')}
+        </div>
+      `;
+      document.getElementById('diet-date').addEventListener('change', (e) => { if (e.target.value) { state.selectedDate = e.target.value; render(); } });
+      document.querySelectorAll('[data-dfood]').forEach(el => el.addEventListener('change', (e) => saveMealField(d, el.dataset.dfood, 'food', e.target.value)));
+      document.querySelectorAll('[data-dcal]').forEach(el => el.addEventListener('change', (e) => saveMealField(d, el.dataset.dcal, 'calories', e.target.value)));
+    }
+
+    function renderSettingsView(main) {
+      const today = getTaipeiToday();
+      const s = state.settings;
+      main.innerHTML = `
+        <div class="space-y-4">
+          <section class="rounded-3xl border border-slate-200/80 bg-white p-5 shadow-sm dark:border-slate-800 dark:bg-slate-900">
+            <div class="mb-4 flex items-center justify-between">
+              <h3 class="font-bold">個人目標與外觀</h3>
+              <button type="button" id="btn-dark" class="rounded-xl bg-slate-100 px-3 py-1.5 text-xs font-semibold dark:bg-slate-800">${s.darkMode ? '☀️ 淺色模式' : '🌙 深色模式'}</button>
+            </div>
+            <form id="set-goal-form" class="space-y-3 text-xs">
+              <div class="grid grid-cols-2 gap-3">
+                <label>初始體重 (kg)<input type="number" step="0.01" id="set-initw" value="${s.initialWeight ?? ''}" class="mt-1 w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-800" /></label>
+                <label>目標體重 (kg)<input type="number" step="0.01" id="set-targw" value="${s.targetWeight ?? ''}" class="mt-1 w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-800" /></label>
+                <label>目標日期<input type="date" id="set-targd" value="${s.targetDate ?? ''}" class="mt-1 w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-800" /></label>
+                <label>每日熱量目標 (kcal)<input type="number" id="set-cal" value="${s.dailyCalorieTarget}" class="mt-1 w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-800" /></label>
+              </div>
+              <button type="submit" class="w-full rounded-2xl bg-teal-600 py-2.5 text-sm font-semibold text-white">儲存目標設定</button>
+            </form>
+          </section>
+
+          <section class="rounded-3xl border border-slate-200/80 bg-white p-5 shadow-sm dark:border-slate-800 dark:bg-slate-900">
+            <h3 class="mb-2 font-bold">資料備份與還原 (JSON)</h3>
+            <p class="mb-3 rounded-2xl bg-slate-50 p-3 text-xs text-slate-600 dark:bg-slate-800/70 dark:text-slate-300">
+              上次確認備份：<strong>${s.lastBackupConfirmedAt ? s.lastBackupConfirmedAt.slice(0,10) : '尚未確認'}</strong>
+            </p>
+            <div class="space-y-2.5">
+              <button type="button" id="btn-backup-json" class="w-full rounded-2xl bg-teal-600 py-3 text-sm font-bold text-white">立即備份 (匯出完整 JSON)</button>
+              ${s.lastBackupGeneratedAt ? `<button type="button" id="btn-confirm-backup" class="w-full rounded-2xl border border-teal-600 bg-teal-50 py-2.5 text-xs font-bold text-teal-700 dark:bg-teal-950/50 dark:text-teal-300">✓ 我已確認將備份檔存入檔案 / iCloud Drive</button>` : ''}
+              <input type="file" id="inp-restore-json" accept=".json,application/json" class="hidden" />
+              <button type="button" id="btn-restore-json" class="w-full rounded-2xl border border-slate-200 py-3 text-sm font-semibold dark:border-slate-700">匯入 JSON 備份還原</button>
+            </div>
+          </section>
+
+          <section class="rounded-3xl border border-slate-200/80 bg-white p-5 shadow-sm dark:border-slate-800 dark:bg-slate-900">
+            <h3 class="mb-1 font-bold">匯出 CSV（Excel 分析用，UTF-8 BOM）</h3>
+            <div class="mt-3 grid grid-cols-1 gap-2 sm:grid-cols-2">
+              <button type="button" id="btn-csv-daily" class="rounded-2xl border border-slate-200 py-2.5 text-xs font-semibold dark:border-slate-700">每日體重與熱量統計 CSV</button>
+              <button type="button" id="btn-csv-ex" class="rounded-2xl border border-slate-200 py-2.5 text-xs font-semibold dark:border-slate-700">運動明細 CSV</button>
+            </div>
+          </section>
+        </div>
+      `;
+
+      document.getElementById('btn-dark').addEventListener('click', async () => {
+        await db.settings.put({ ...state.settings, darkMode: !state.settings.darkMode, updatedAt: new Date().toISOString() });
+        await loadAllData(); render();
+      });
+      document.getElementById('set-goal-form').addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const next = {
+          ...state.settings,
+          initialWeight: document.getElementById('set-initw').value.trim() ? Number(document.getElementById('set-initw').value) : null,
+          targetWeight: document.getElementById('set-targw').value.trim() ? Number(document.getElementById('set-targw').value) : null,
+          targetDate: document.getElementById('set-targd').value.trim() || null,
+          dailyCalorieTarget: Math.max(800, Math.round(Number(document.getElementById('set-cal').value) || 1800)),
+          updatedAt: new Date().toISOString()
+        };
+        await db.settings.put(next); await loadAllData(); render(); showToast('設定已儲存');
+      });
+      document.getElementById('btn-backup-json').addEventListener('click', async () => {
+        const payload = {
+          app: 'light-log-weight-tracker', schemaVersion: 1, backupVersion: '1.0.0', exportedAt: new Date().toISOString(),
+          data: { settings: await db.settings.toArray(), weightLogs: await db.weightLogs.toArray(), mealLogs: await db.mealLogs.toArray(), exercisePlans: await db.exercisePlans.toArray(), exerciseOverrides: await db.exerciseOverrides.toArray(), exerciseLogs: await db.exerciseLogs.toArray() }
+        };
+        const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+        downloadBlob(blob, `weight-backup-${formatTaipeiFilenameTs()}.json`);
+        await db.settings.put({ ...state.settings, lastBackupGeneratedAt: new Date().toISOString(), updatedAt: new Date().toISOString() });
+        await loadAllData(); render(); showToast('已產生備份檔，請確認儲存後點擊確認按鈕');
+      });
+      document.getElementById('btn-confirm-backup')?.addEventListener('click', async () => {
+        await db.settings.put({ ...state.settings, lastBackupConfirmedAt: new Date().toISOString(), updatedAt: new Date().toISOString() });
+        await loadAllData(); render(); showToast('已更新上次確認備份日期');
+      });
+      document.getElementById('btn-restore-json').addEventListener('click', () => document.getElementById('inp-restore-json').click());
+      document.getElementById('inp-restore-json').addEventListener('change', async (e) => {
+        const file = e.target.files?.[0]; e.target.value = '';
+        if (!file) return;
+        try {
+          const parsed = JSON.parse(await file.text());
+          if (parsed?.app !== 'light-log-weight-tracker' || parsed?.schemaVersion !== 1 || !parsed?.data) {
+            return showToast('備份格式或版本不相容，已取消匯入');
+          }
+          openRestoreConfirmModal(parsed);
+        } catch { showToast('JSON 解析失敗，原有資料安全保留'); }
+      });
+      document.getElementById('btn-csv-daily').addEventListener('click', () => {
+        const dates = Array.from(new Set([...state.weightLogs.map(w=>w.date), ...state.mealLogs.map(m=>m.date), ...state.exerciseLogs.map(e=>e.date)])).sort();
+        const header = '日期,體重(kg),早餐熱量(kcal),午餐熱量(kcal),晚餐熱量(kcal),其他熱量(kcal),當日總攝取(kcal),當日攝取目標(kcal),運動項目,運動時間(分鐘),運動消耗熱量(kcal)';
+        const rows = dates.map(dt => {
+          const w = state.weightLogs.find(x=>x.date===dt);
+          const m = state.mealLogs.find(x=>x.date===dt);
+          const ex = state.exerciseLogs.filter(x=>x.date===dt && x.completed);
+          const cal = computeDailyCalorieSummary(dt);
+          return [dt, w ? w.weight.toFixed(2) : '', m?.breakfast.calories ?? '未記錄', m?.lunch.calories ?? '未記錄', m?.dinner.calories ?? '未記錄', m?.other.calories ?? '未記錄', cal.totalIntake ?? '未記錄', cal.targetCalories, ex.map(x=>x.name).join(' / '), ex.length ? ex.reduce((s,x)=>s+(x.actualMinutes??x.plannedMinutes),0) : '', ex.length ? ex.reduce((s,x)=>s+(x.caloriesBurned??0),0) : ''].join(',');
+        });
+        downloadBlob(new Blob(['\uFEFF' + [header, ...rows].join('\r\n')], { type: 'text/csv;charset=utf-8' }), `daily-summary-${today}.csv`);
+        showToast('已匯出每日統計 CSV');
+      });
+      document.getElementById('btn-csv-ex').addEventListener('click', () => {
+        const header = '日期,運動項目,是否完成,預定時間(分鐘),實際時間(分鐘),消耗熱量(kcal)';
+        const rows = state.exerciseLogs.map(e => [e.date, e.name, e.completed ? '已完成' : '未完成', e.plannedMinutes, e.actualMinutes ?? '', e.caloriesBurned ?? ''].join(','));
+        downloadBlob(new Blob(['\uFEFF' + [header, ...rows].join('\r\n')], { type: 'text/csv;charset=utf-8' }), `exercise-details-${today}.csv`);
+        showToast('已匯出運動明細 CSV');
+      });
+    }
+
+    function downloadBlob(blob, filename) {
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url; a.download = filename;
+      document.body.appendChild(a); a.click(); document.body.removeChild(a);
+      setTimeout(() => URL.revokeObjectURL(url), 10000);
+    }
+
+    function openRestoreConfirmModal(payload) {
+      const root = document.getElementById('modal-root');
+      root.innerHTML = `
+        <div class="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/60 p-4">
+          <div class="w-full max-w-sm rounded-3xl bg-white p-5 shadow-xl dark:bg-slate-900">
+            <h4 class="font-bold text-amber-600">確認覆蓋還原資料？</h4>
+            <p class="mt-2 text-xs text-slate-500">備份包含體重 ${payload.data.weightLogs?.length || 0} 筆、飲食 ${payload.data.mealLogs?.length || 0} 筆、運動 ${payload.data.exerciseLogs?.length || 0} 筆。覆蓋後無法復原！</p>
+            <div class="mt-4 flex justify-end gap-2">
+              <button type="button" id="m-cancel" class="rounded-xl px-4 py-2 text-xs">取消</button>
+              <button type="button" id="m-confirm" class="rounded-xl bg-rose-600 px-4 py-2 text-xs font-bold text-white">確認覆蓋還原</button>
+            </div>
+          </div>
+        </div>`;
+      document.getElementById('m-cancel').addEventListener('click', () => { root.innerHTML = ''; });
+      document.getElementById('m-confirm').addEventListener('click', async () => {
+        await db.transaction('rw', [db.settings, db.weightLogs, db.mealLogs, db.exercisePlans, db.exerciseOverrides, db.exerciseLogs], async () => {
+          await Promise.all([db.settings.clear(), db.weightLogs.clear(), db.mealLogs.clear(), db.exercisePlans.clear(), db.exerciseOverrides.clear(), db.exerciseLogs.clear()]);
+          if (payload.data.settings?.length) await db.settings.bulkPut(payload.data.settings);
+          if (payload.data.weightLogs?.length) await db.weightLogs.bulkPut(payload.data.weightLogs);
+          if (payload.data.mealLogs?.length) await db.mealLogs.bulkPut(payload.data.mealLogs);
+          if (payload.data.exercisePlans?.length) await db.exercisePlans.bulkPut(payload.data.exercisePlans);
+          if (payload.data.exerciseOverrides?.length) await db.exerciseOverrides.bulkPut(payload.data.exerciseOverrides);
+          if (payload.data.exerciseLogs?.length) await db.exerciseLogs.bulkPut(payload.data.exerciseLogs);
+        });
+        root.innerHTML = ''; await loadAllData(); render(); showToast('備份還原成功！');
+      });
+    }
+
+    function openCheckinModal(dateStr) {
+      const root = document.getElementById('modal-root');
+      root.innerHTML = `
+        <div class="fixed inset-0 z-50 flex items-end justify-center bg-slate-900/60 sm:items-center sm:p-4">
+          <div class="w-full max-w-md rounded-t-3xl bg-white p-5 shadow-xl dark:bg-slate-900 sm:rounded-3xl">
+            <div class="mb-4 flex items-center justify-between"><h3 class="font-bold">產生今日打卡圖片 (PNG)</h3><button type="button" id="ck-close" class="text-sm text-slate-500">✕</button></div>
+            <div class="space-y-3 text-sm">
+              <div class="grid grid-cols-2 gap-2">
+                <label class="flex items-center gap-2 rounded-xl border p-2.5"><input type="radio" name="ck-size" value="story" checked />直式 1080×1920</label>
+                <label class="flex items-center gap-2 rounded-xl border p-2.5"><input type="radio" name="ck-size" value="square" />正方形 1080×1080</label>
+              </div>
+              <div class="grid grid-cols-2 gap-2">
+                <label class="flex items-center gap-2 rounded-xl border p-2.5"><input type="radio" name="ck-theme" value="light" checked />清爽淺色</label>
+                <label class="flex items-center gap-2 rounded-xl border p-2.5"><input type="radio" name="ck-theme" value="dark" />質感深色</label>
+              </div>
+              <label class="flex items-center justify-between rounded-xl bg-slate-50 p-3 dark:bg-slate-800"><span>顯示體重數字</span><input type="checkbox" id="ck-w" checked class="h-4 w-4" /></label>
+              <label class="flex items-center justify-between rounded-xl bg-slate-50 p-3 dark:bg-slate-800"><span>顯示飲食文字</span><input type="checkbox" id="ck-f" checked class="h-4 w-4" /></label>
+              <button type="button" id="ck-dl" class="w-full rounded-2xl bg-teal-600 py-3 font-bold text-white">下載打卡 PNG 圖片</button>
+            </div>
+          </div>
+        </div>`;
+      document.getElementById('ck-close').addEventListener('click', () => { root.innerHTML = ''; });
+      document.getElementById('ck-dl').addEventListener('click', async () => {
+        const size = document.querySelector('input[name="ck-size"]:checked').value;
+        const theme = document.querySelector('input[name="ck-theme"]:checked').value;
+        const showW = document.getElementById('ck-w').checked;
+        const showF = document.getElementById('ck-f').checked;
+        const w = 1080, h = size === 'story' ? 1920 : 1080;
+        const c = document.createElement('canvas'); c.width = w; c.height = h;
+        const ctx = c.getContext('2d');
+        const dark = theme === 'dark';
+        const grad = ctx.createLinearGradient(0, 0, w, h);
+        grad.addColorStop(0, dark ? '#0f172a' : '#f0fdfa');
+        grad.addColorStop(1, dark ? '#115e59' : '#e6fffa');
+        ctx.fillStyle = grad; ctx.fillRect(0, 0, w, h);
+        ctx.fillStyle = dark ? '#f8fafc' : '#0f172a';
+        ctx.font = 'bold 52px "PingFang TC", "Noto Sans TC", sans-serif';
+        ctx.fillText('今日健康打卡', 64, 120);
+        ctx.font = '600 30px "PingFang TC", "Noto Sans TC", sans-serif';
+        ctx.fillStyle = dark ? '#94a3b8' : '#64748b';
+        ctx.fillText(`${dateStr.replace(/-/g,'/')} (${getWeekdayLabel(dateStr)})`, 64, 175);
+
+        const wLog = state.weightLogs.find(x => x.date === dateStr);
+        const cal = computeDailyCalorieSummary(dateStr);
+        ctx.fillStyle = dark ? '#2dd4bf' : '#0d9488';
+        ctx.font = 'bold 56px "PingFang TC", sans-serif';
+        ctx.fillText(`今日體重：${showW ? (wLog ? wLog.weight.toFixed(1) + ' kg' : '未記錄') : '已隱藏'}`, 64, 300);
+
+        const mLog = state.mealLogs.find(x => x.date === dateStr);
+        ctx.fillStyle = dark ? '#f8fafc' : '#0f172a';
+        ctx.font = '600 32px "PingFang TC", sans-serif';
+        let yy = 400;
+        [['早餐','breakfast'],['午餐','lunch'],['晚餐','dinner'],['其他','other']].forEach(([lbl, k]) => {
+          const en = mLog?.[k];
+          const txt = `${lbl}${showF && en?.food ? ' — ' + en.food.slice(0,16) : ''}：${en?.calories !== null && en?.calories !== undefined ? en.calories + ' kcal' : '未記錄'}`;
+          ctx.fillText(txt, 64, yy); yy += 64;
+        });
+        ctx.fillText(`總攝取：${cal.totalIntake ?? '未記錄'} / 目標：${cal.targetCalories} kcal`, 64, yy + 20);
+        ctx.fillText(`運動總消耗：${cal.exerciseBurned} kcal`, 64, yy + 84);
+        c.toBlob(blob => { downloadBlob(blob, `health-checkin-${dateStr}-${size}.png`); showToast('已下載打卡 PNG 圖片'); }, 'image/png');
+      });
+    }
+
+    function render() {
+      destroyCharts();
+      renderBottomNav();
+      const main = document.getElementById('app-main');
+      if (state.tab === 'dashboard') renderDashboard(main);
+      else if (state.tab === 'weight') renderWeightView(main);
+      else if (state.tab === 'exercise') renderExerciseView(main);
+      else if (state.tab === 'diet') renderDietView(main);
+      else renderSettingsView(main);
+    }
+
+    (async () => {
+      try {
+        await db.open();
+        await db.transaction('rw', db.settings, db.exercisePlans, async () => {
+          if (!(await db.settings.get('main'))) await db.settings.put({ ...DEFAULT_SETTINGS });
+          if ((await db.exercisePlans.count()) === 0) await db.exercisePlans.bulkPut(DEFAULT_PLANS);
+        });
+        await loadAllData();
+        render();
+      } catch (err) {
+        document.getElementById('app-main').innerHTML = `<div class="rounded-3xl border border-rose-200 bg-rose-50 p-6 text-rose-900"><strong>本機資料庫開啟失敗</strong><p class="mt-2 text-xs">${escHtml(err.message)}</p></div>`;
+      }
+    })();
+  </script>
+  <script>
+    if ('serviceWorker' in navigator) {
+      window.addEventListener('load', () => {
+        navigator.serviceWorker.register('./sw.js').catch(() => {});
+      });
+    }
+  </script>
+</body>
+</html>

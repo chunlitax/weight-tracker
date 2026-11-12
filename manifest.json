@@ -1,0 +1,26 @@
+{
+  "name": "輕盈日誌 — 個人減重與運動管理",
+  "short_name": "輕盈日誌",
+  "description": "專為個人長期使用設計的離線減重、運動排程與飲食熱量管理 App",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#f8fafc",
+  "theme_color": "#0d9488",
+  "lang": "zh-Hant-TW",
+  "icons": [
+    {
+      "src": "./icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "./icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}
