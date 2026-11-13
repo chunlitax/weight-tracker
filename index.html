@@ -137,10 +137,23 @@
       const display = value ? value.replace(/-/g, '/') : '年 / 月 / 日';
       return `
         <div class="relative flex items-center justify-between overflow-hidden rounded-xl border border-muji-border bg-muji-soft px-3 py-2 text-sm dark:border-stone-700 dark:bg-stone-800 ${extraClass}">
-          <span class="truncate font-medium ${value ? '' : 'text-muji-muted'}">${display}</span>
+          <span id="${id}-display" class="truncate font-medium ${value ? '' : 'text-muji-muted'}">${display}</span>
           <span class="ml-2 shrink-0 text-xs text-muji-muted">▾</span>
           <input type="date" id="${id}" value="${escHtml(value || '')}" ${max ? `max="${max}"` : ''} class="absolute inset-0 h-full w-full cursor-pointer opacity-0" />
         </div>`;
+    }
+    function bindDateDisplaySync(id, onChangeCb) {
+      const inp = document.getElementById(id);
+      const disp = document.getElementById(id + '-display');
+      if (!inp) return;
+      inp.addEventListener('change', (e) => {
+        const v = e.target.value;
+        if (disp) {
+          disp.textContent = v ? v.replace(/-/g, '/') : '年 / 月 / 日';
+          disp.classList.toggle('text-muji-muted', !v);
+        }
+        if (onChangeCb) onChangeCb(v);
+      });
     }
 
     // ========= 2. Dexie.js IndexedDB 資料庫 =========
@@ -177,7 +190,10 @@
     const state = {
       tab: 'dashboard',
       selectedDate: getTaipeiToday(),
-      weightRange: '30',
+      weightFormDate: getTaipeiToday(),
+      weightRange: '15',
+      exerciseRange: '15',
+      dietRange: '15',
       expandedExKey: null,
       settings: { ...DEFAULT_SETTINGS },
       weightLogs: [],
@@ -186,7 +202,7 @@
       exerciseOverrides: [],
       exerciseLogs: [],
       charts: {},
-      checkin: { size: 'story', theme: 'light', showWeight: true, showFood: true, blob: null, dataUrl: null }
+      checkin: { size: 'square', showWeight: true, showFood: true, blob: null, dataUrl: null }
     };
 
     function showToast(msg) {
@@ -375,6 +391,108 @@
     function destroyCharts() {
       Object.values(state.charts).forEach(c => c?.destroy());
       state.charts = {};
+    }
+
+    function getTimelineDates(allRecordDates, minDays = 30) {
+      const today = getTaipeiToday();
+      let start = addDays(today, -(minDays - 1));
+      for (const d of allRecordDates) {
+        if (d && d < start) start = d;
+      }
+      const dates = [];
+      let cur = start;
+      let guard = 0;
+      while (cur <= today && guard < 1500) {
+        dates.push(cur);
+        cur = addDays(cur, 1);
+        guard++;
+      }
+      return dates;
+    }
+
+    function renderRangePills(attrName, activeVal) {
+      const opts = [['7', '一週'], ['15', '半月'], ['30', '一個月'], ['all', '全部']];
+      return `
+        <div class="flex rounded-xl bg-muji-soft p-1 text-xs dark:bg-stone-800">
+          ${opts.map(([v, lbl]) => `
+            <button type="button" ${attrName}="${v}" class="rounded-lg px-2.5 py-1 font-medium ${activeVal === v ? 'bg-white text-muji-red shadow-sm dark:bg-stone-700 dark:text-red-300' : 'text-muji-muted'}">${lbl}</button>
+          `).join('')}
+        </div>`;
+    }
+
+    function computeOptimalYBounds(values, clampZero = false, minPad = 1) {
+      const nums = values.filter(v => v !== null && v !== undefined && !Number.isNaN(v));
+      if (nums.length === 0) return { min: 0, max: 100 };
+      let mn = Math.min(...nums);
+      let mx = Math.max(...nums);
+      const span = mx - mn;
+      const pad = span > 0 ? Math.max(minPad * 0.5, span * 0.18) : minPad;
+      let yMin = mn - pad;
+      let yMax = mx + pad;
+      if (clampZero && yMin < 0) yMin = 0;
+      return {
+        min: Number(yMin.toFixed(1)),
+        max: Number(yMax.toFixed(1))
+      };
+    }
+
+    function mountStockChart(yAxisCanvasId, scrollId, canvasId, chartKey, dates, rangeVal, yBounds, chartConfig) {
+      const yCanvas = document.getElementById(yAxisCanvasId);
+      const scroller = document.getElementById(scrollId);
+      const inner = scroller?.firstElementChild;
+      const canvas = document.getElementById(canvasId);
+      if (!scroller || !inner || !canvas || !yCanvas) return;
+
+      if (rangeVal === 'all') {
+        inner.style.width = '100%';
+      } else {
+        const winDays = Number(rangeVal);
+        const pct = Math.max(100, (dates.length / winDays) * 100);
+        inner.style.width = pct + '%';
+      }
+
+      // 固定左側 Y 軸畫布
+      state.charts[chartKey + '_y'] = new Chart(yCanvas, {
+        type: 'line',
+        data: { labels: [''], datasets: [{ data: [] }] },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          animation: false,
+          layout: { padding: { top: 8, bottom: 26, left: 2, right: 0 } },
+          plugins: { legend: { display: false }, tooltip: { enabled: false } },
+          scales: {
+            x: { display: false },
+            y: {
+              min: yBounds.min,
+              max: yBounds.max,
+              afterFit: (scale) => { scale.width = 58; },
+              grid: { display: false },
+              ticks: { font: { size: 11 }, color: '#7A6F64', padding: 6 }
+            }
+          }
+        }
+      });
+
+      // 右側可左右滑動的主趨勢圖（隱藏內建 Y 軸）
+      chartConfig.options = chartConfig.options || {};
+      chartConfig.options.plugins = { ...(chartConfig.options.plugins || {}), legend: { display: false } };
+      chartConfig.options.layout = { padding: { top: 8, bottom: 0, right: 10 } };
+      chartConfig.options.scales = {
+        ...(chartConfig.options.scales || {}),
+        y: {
+          min: yBounds.min,
+          max: yBounds.max,
+          ticks: { display: false },
+          grid: { color: 'rgba(122, 111, 100, 0.12)' },
+          border: { display: false }
+        }
+      };
+
+      state.charts[chartKey] = new Chart(canvas, chartConfig);
+      requestAnimationFrame(() => {
+        scroller.scrollLeft = scroller.scrollWidth;
+      });
     }
 
     function renderBottomNav() {
@@ -571,13 +689,19 @@
     function renderWeightView(main) {
       const today = getTaipeiToday();
       const s = computeWeightStats();
-      const cutoff = state.weightRange === 'all' ? '0000-00-00' : addDays(today, -(Number(state.weightRange) - 1));
-      const ma7All = s.sorted.map(item => {
+      const dates = getTimelineDates(s.sorted.map(l => l.date), 30);
+      const wMap = new Map(s.sorted.map(l => [l.date, l.weight]));
+
+      // 依實際紀錄計算 7 日移動平均
+      const ma7Map = new Map();
+      s.sorted.forEach(item => {
         const minD = addDays(item.date, -6);
         const win = s.sorted.filter(l => l.date >= minD && l.date <= item.date);
-        return round2(win.reduce((sum, l) => sum + l.weight, 0) / win.length);
+        ma7Map.set(item.date, round2(win.reduce((sum, l) => sum + l.weight, 0) / win.length));
       });
-      const filtered = s.sorted.map((l, idx) => ({ l, ma7: ma7All[idx] })).filter(x => x.l.date >= cutoff);
+
+      const dailySeries = dates.map(d => wMap.get(d) ?? null);
+      const ma7Series = dates.map(d => ma7Map.get(d) ?? null);
 
       main.innerHTML = `
         <div class="space-y-4">
@@ -591,22 +715,37 @@
           </section>
 
           <section class="rounded-2xl border border-muji-border bg-muji-card p-4 dark:border-stone-800 dark:bg-stone-900">
-            <div class="mb-3 flex flex-wrap items-center justify-between gap-2">
-              <h3 class="font-bold">體重趨勢圖</h3>
-              <div class="flex rounded-xl bg-muji-soft p-1 text-xs dark:bg-stone-800">
-                ${[['7','7天'],['30','30天'],['90','90天'],['all','全部']].map(([v,lbl]) => `
-                  <button type="button" data-wrange="${v}" class="rounded-lg px-2.5 py-1 font-medium ${state.weightRange === v ? 'bg-white text-muji-red shadow-sm dark:bg-stone-700 dark:text-red-300' : 'text-muji-muted'}">${lbl}</button>
-                `).join('')}
+            <div class="mb-2 flex flex-wrap items-center justify-between gap-2">
+              <div>
+                <h3 class="font-bold">體重趨勢圖</h3>
+                <p class="text-[11px] text-muji-muted">可左右滑動檢視歷史日期</p>
               </div>
+              ${renderRangePills('data-wrange', state.weightRange)}
             </div>
-            ${filtered.length === 0 ? `<div class="flex h-56 items-center justify-center rounded-xl bg-muji-soft text-sm text-muji-muted dark:bg-stone-800/50">尚無體重紀錄，請於下方新增</div>` : `<div class="relative h-64"><canvas id="weight-chart"></canvas></div>`}
+            ${s.sorted.length === 0 ? `<div class="flex h-56 items-center justify-center rounded-xl bg-muji-soft text-sm text-muji-muted dark:bg-stone-800/50">尚無體重紀錄，請於下方新增</div>` : `
+              <div class="flex items-stretch">
+                <div class="relative h-64 w-[60px] shrink-0">
+                  <canvas id="weight-yaxis"></canvas>
+                </div>
+                <div id="w-chart-scroll" class="min-w-0 flex-1 overflow-x-auto overscroll-x-contain">
+                  <div class="relative h-64">
+                    <canvas id="weight-chart"></canvas>
+                  </div>
+                </div>
+              </div>
+              <div class="mt-2 flex flex-wrap items-center justify-center gap-4 text-xs text-muji-muted">
+                <span class="flex items-center gap-1.5"><span class="inline-block h-0.5 w-4 bg-muji-red"></span>每日體重 (kg)</span>
+                <span class="flex items-center gap-1.5"><span class="inline-block h-0.5 w-4 border-t-2 border-dashed border-muji-brown"></span>7 日移動平均</span>
+                ${state.settings.targetWeight !== null ? '<span class="flex items-center gap-1.5"><span class="inline-block h-0.5 w-4 border-t-2 border-dashed border-stone-400"></span>目標體重</span>' : ''}
+              </div>
+            `}
           </section>
 
           <section class="rounded-2xl border border-muji-border bg-muji-card p-4 dark:border-stone-800 dark:bg-stone-900">
             <h3 class="mb-3 font-bold">新增或補登體重</h3>
             <form id="w-add-form" class="space-y-3">
               <div class="grid grid-cols-1 gap-2.5 sm:grid-cols-2">
-                <label class="block min-w-0 text-xs">日期<div class="mt-1">${renderDatePicker('w-f-date', today, today)}</div></label>
+                <label class="block min-w-0 text-xs">日期<div class="mt-1">${renderDatePicker('w-f-date', state.weightFormDate, today)}</div></label>
                 <label class="block min-w-0 text-xs">體重 (kg)<input type="number" id="w-f-val" inputmode="decimal" step="0.01" placeholder="68.25" class="mt-1 w-full rounded-xl border border-muji-border bg-muji-soft px-3 py-2 text-sm dark:border-stone-700 dark:bg-stone-800" /></label>
               </div>
               <div class="flex gap-2">
@@ -631,6 +770,7 @@
       `;
 
       document.querySelectorAll('[data-wrange]').forEach(b => b.addEventListener('click', () => { state.weightRange = b.dataset.wrange; render(); }));
+      bindDateDisplaySync('w-f-date', (v) => { if (v) state.weightFormDate = v; });
       document.getElementById('w-add-form').addEventListener('submit', (e) => {
         e.preventDefault();
         const dt = document.getElementById('w-f-date').value;
@@ -644,18 +784,19 @@
         await loadAllData(); render(); showToast('已刪除體重紀錄');
       }));
 
-      if (filtered.length > 0 && document.getElementById('weight-chart')) {
+      if (s.sorted.length > 0) {
         const datasets = [
-          { label: '每日體重 (kg)', data: filtered.map(x => x.l.weight), borderColor: '#8B3A34', tension: 0.25 },
-          { label: '7 日移動平均', data: filtered.map(x => x.ma7), borderColor: '#6E5B4B', borderDash: [4, 4], pointRadius: 0 }
+          { label: '每日體重 (kg)', data: dailySeries, borderColor: '#8B3A34', backgroundColor: 'rgba(139,58,52,0.08)', fill: true, spanGaps: true, tension: 0.25, pointRadius: 4 },
+          { label: '7 日移動平均', data: ma7Series, borderColor: '#6E5B4B', borderDash: [4, 4], spanGaps: true, pointRadius: 0 }
         ];
         if (state.settings.targetWeight !== null) {
-          datasets.push({ label: '目標體重', data: filtered.map(() => state.settings.targetWeight), borderColor: '#9C8F82', borderDash: [6, 6], pointRadius: 0, borderWidth: 1.5 });
+          datasets.push({ label: '目標體重', data: dates.map(() => state.settings.targetWeight), borderColor: '#9C8F82', borderDash: [6, 6], pointRadius: 0, borderWidth: 1.5 });
         }
-        state.charts.weight = new Chart(document.getElementById('weight-chart'), {
+        const wBounds = computeOptimalYBounds([...dailySeries, ...ma7Series], false, 1.5);
+        mountStockChart('weight-yaxis', 'w-chart-scroll', 'weight-chart', 'weight', dates, state.weightRange, wBounds, {
           type: 'line',
-          data: { labels: filtered.map(x => x.l.date.slice(5).replace('-', '/')), datasets },
-          options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { position: 'bottom' } } }
+          data: { labels: dates.map(d => d.slice(5).replace('-', '/')), datasets },
+          options: { responsive: true, maintainAspectRatio: false, interaction: { mode: 'index', intersect: false }, plugins: { legend: { position: 'bottom' } } }
         });
       }
     }
@@ -685,6 +826,29 @@
             <div class="rounded-2xl border border-muji-border bg-muji-card p-4 dark:border-stone-800 dark:bg-stone-900">
               <div class="text-xs text-muji-muted">本週完成率</div>
               <div class="mt-1 text-xl font-bold text-muji-red dark:text-red-300">${rate !== null ? rate + '%' : '--'}</div>
+            </div>
+          </section>
+
+          <section class="rounded-2xl border border-muji-border bg-muji-card p-4 dark:border-stone-800 dark:bg-stone-900">
+            <div class="mb-2 flex flex-wrap items-center justify-between gap-2">
+              <div>
+                <h3 class="font-bold">運動消耗趨勢圖 (kcal)</h3>
+                <p class="text-[11px] text-muji-muted">可左右滑動檢視歷史日期</p>
+              </div>
+              ${renderRangePills('data-exrange', state.exerciseRange)}
+            </div>
+            <div class="flex items-stretch">
+              <div class="relative h-56 w-[60px] shrink-0">
+                <canvas id="ex-yaxis"></canvas>
+              </div>
+              <div id="ex-chart-scroll" class="min-w-0 flex-1 overflow-x-auto overscroll-x-contain">
+                <div class="relative h-56">
+                  <canvas id="ex-burn-chart"></canvas>
+                </div>
+              </div>
+            </div>
+            <div class="mt-2 flex items-center justify-center gap-4 text-xs text-muji-muted">
+              <span class="flex items-center gap-1.5"><span class="inline-block h-0.5 w-4 bg-muji-brown"></span>每日運動消耗 (kcal)</span>
             </div>
           </section>
 
@@ -754,6 +918,22 @@
           </section>
         </div>
       `;
+
+      document.querySelectorAll('[data-exrange]').forEach(b => b.addEventListener('click', () => { state.exerciseRange = b.dataset.exrange; render(); }));
+      const exDates = getTimelineDates(state.exerciseLogs.map(l => l.date), 30);
+      const exBurnSeries = exDates.map(dt => {
+        const dayDone = state.exerciseLogs.filter(l => l.date === dt && l.completed && l.caloriesBurned !== null);
+        return dayDone.length ? dayDone.reduce((sum, l) => sum + (l.caloriesBurned ?? 0), 0) : null;
+      });
+      const exBounds = computeOptimalYBounds(exBurnSeries, true, 50);
+      mountStockChart('ex-yaxis', 'ex-chart-scroll', 'ex-burn-chart', 'exercise', exDates, state.exerciseRange, exBounds, {
+        type: 'line',
+        data: {
+          labels: exDates.map(dt => dt.slice(5).replace('-', '/')),
+          datasets: [{ label: '每日運動消耗 (kcal)', data: exBurnSeries, borderColor: '#6E5B4B', backgroundColor: 'rgba(110,91,75,0.12)', fill: true, spanGaps: false, tension: 0.25, pointRadius: 4 }]
+        },
+        options: { responsive: true, maintainAspectRatio: false, interaction: { mode: 'index', intersect: false }, plugins: { legend: { position: 'bottom' } } }
+      });
 
       document.getElementById('ex-date').addEventListener('change', (e) => { if (e.target.value) { state.selectedDate = e.target.value; render(); } });
       document.querySelectorAll('[data-exv-toggle]').forEach(btn => btn.addEventListener('click', () => {
@@ -825,6 +1005,13 @@
       const mLog = state.mealLogs.find(m => m.date === d);
       const cal = computeDailyCalorieSummary(d);
 
+      const dDates = getTimelineDates(state.mealLogs.map(m => m.date), 30);
+      const intakeSeries = dDates.map(dt => computeDailyCalorieSummary(dt).totalIntake);
+      const targetSeries = dDates.map(dt => {
+        const ml = state.mealLogs.find(m => m.date === dt);
+        return ml?.targetCaloriesSnapshot ?? state.settings.dailyCalorieTarget;
+      });
+
       main.innerHTML = `
         <div class="space-y-4">
           <section class="flex flex-wrap items-center justify-between gap-2 rounded-2xl border border-muji-border bg-muji-card p-4 dark:border-stone-800 dark:bg-stone-900">
@@ -835,6 +1022,31 @@
             <div class="rounded-2xl border border-muji-border bg-muji-card p-3.5 dark:border-stone-800 dark:bg-stone-900"><div class="text-xs text-muji-muted">當日總攝取</div><div class="mt-1 text-lg font-bold">${cal.totalIntake !== null ? cal.totalIntake + ' kcal' : '未記錄'}</div></div>
             <div class="rounded-2xl border border-muji-border bg-muji-card p-3.5 dark:border-stone-800 dark:bg-stone-900"><div class="text-xs text-muji-muted">剩餘額度</div><div class="mt-1 text-lg font-bold text-muji-red dark:text-red-300">${cal.remainingQuota !== null ? cal.remainingQuota + ' kcal' : '未記錄'}</div></div>
           </section>
+
+          <section class="rounded-2xl border border-muji-border bg-muji-card p-4 dark:border-stone-800 dark:bg-stone-900">
+            <div class="mb-2 flex flex-wrap items-center justify-between gap-2">
+              <div>
+                <h3 class="font-bold">攝取熱量趨勢圖 (kcal)</h3>
+                <p class="text-[11px] text-muji-muted">可左右滑動檢視歷史日期</p>
+              </div>
+              ${renderRangePills('data-drange', state.dietRange)}
+            </div>
+            <div class="flex items-stretch">
+              <div class="relative h-56 w-[60px] shrink-0">
+                <canvas id="diet-yaxis"></canvas>
+              </div>
+              <div id="d-chart-scroll" class="min-w-0 flex-1 overflow-x-auto overscroll-x-contain">
+                <div class="relative h-56">
+                  <canvas id="diet-intake-chart"></canvas>
+                </div>
+              </div>
+            </div>
+            <div class="mt-2 flex flex-wrap items-center justify-center gap-4 text-xs text-muji-muted">
+              <span class="flex items-center gap-1.5"><span class="inline-block h-0.5 w-4 bg-muji-red"></span>每日攝取 (kcal)</span>
+              <span class="flex items-center gap-1.5"><span class="inline-block h-0.5 w-4 border-t-2 border-dashed border-stone-400"></span>每日目標</span>
+            </div>
+          </section>
+
           ${[['breakfast','早餐'],['lunch','午餐'],['dinner','晚餐'],['other','其他飲食（選填）']].map(([k, lbl]) => {
             const entry = mLog?.[k];
             return `
@@ -848,8 +1060,22 @@
         </div>
       `;
       document.getElementById('diet-date').addEventListener('change', (e) => { if (e.target.value) { state.selectedDate = e.target.value; render(); } });
+      document.querySelectorAll('[data-drange]').forEach(b => b.addEventListener('click', () => { state.dietRange = b.dataset.drange; render(); }));
       document.querySelectorAll('[data-dfood]').forEach(el => el.addEventListener('change', (e) => saveMealField(d, el.dataset.dfood, 'food', e.target.value)));
       document.querySelectorAll('[data-dcal]').forEach(el => el.addEventListener('change', (e) => saveMealField(d, el.dataset.dcal, 'calories', e.target.value)));
+
+      const dBounds = computeOptimalYBounds([...intakeSeries, ...targetSeries], true, 200);
+      mountStockChart('diet-yaxis', 'd-chart-scroll', 'diet-intake-chart', 'diet', dDates, state.dietRange, dBounds, {
+        type: 'line',
+        data: {
+          labels: dDates.map(dt => dt.slice(5).replace('-', '/')),
+          datasets: [
+            { label: '每日攝取 (kcal)', data: intakeSeries, borderColor: '#8B3A34', backgroundColor: 'rgba(139,58,52,0.10)', fill: true, spanGaps: false, tension: 0.25, pointRadius: 4 },
+            { label: '每日目標', data: targetSeries, borderColor: '#9C8F82', borderDash: [5, 5], pointRadius: 0, borderWidth: 1.5 }
+          ]
+        },
+        options: { responsive: true, maintainAspectRatio: false, interaction: { mode: 'index', intersect: false }, plugins: { legend: { position: 'bottom' } } }
+      });
     }
 
     function renderSettingsView(main) {
@@ -898,6 +1124,7 @@
         </div>
       `;
 
+      bindDateDisplaySync('set-targd');
       document.getElementById('btn-dark').addEventListener('click', async () => {
         await db.settings.put({ ...state.settings, darkMode: !state.settings.darkMode, updatedAt: new Date().toISOString() });
         await loadAllData(); render();
@@ -1081,51 +1308,37 @@
 
     async function openCheckinModal(dateStr) {
       const root = document.getElementById('modal-root');
-      const renderModal = async () => {
-        const { blob, dataUrl } = await buildCheckinBlob(dateStr, state.checkin);
-        state.checkin.blob = blob;
-        state.checkin.dataUrl = dataUrl;
-        root.innerHTML = `
-          <div class="fixed inset-0 z-50 flex items-end justify-center bg-stone-900/70 sm:items-center sm:p-4">
-            <div class="max-h-[92dvh] w-full max-w-md overflow-y-auto rounded-t-3xl bg-muji-card p-5 shadow-xl dark:bg-stone-900 sm:rounded-3xl">
-              <div class="mb-3 flex items-center justify-between">
-                <h3 class="font-bold text-muji-red dark:text-red-300">今日打卡分享圖預覽</h3>
-                <button type="button" id="ck-close" class="rounded-full px-2 py-1 text-sm text-muji-muted">✕</button>
-              </div>
-              <div class="mb-3 flex justify-center rounded-2xl border border-muji-border bg-muji-soft p-2 dark:border-stone-700 dark:bg-stone-800">
-                <img src="${dataUrl}" alt="今日健康打卡預覽圖" class="max-h-72 w-auto rounded-xl object-contain shadow-sm" />
-              </div>
-              <p class="mb-3 text-center text-[11px] text-muji-muted">提示：可直接點下方「iPhone 分享」傳送至 LINE / IG，或長按上方圖片儲存</p>
-              <div class="space-y-2.5 text-xs">
-                <div class="grid grid-cols-2 gap-2">
-                  <button type="button" data-ck-size="story" class="rounded-xl border px-3 py-2 font-medium ${state.checkin.size === 'story' ? 'border-muji-red bg-muji-soft text-muji-red font-bold' : 'border-muji-border'}">直式 1080×1920</button>
-                  <button type="button" data-ck-size="square" class="rounded-xl border px-3 py-2 font-medium ${state.checkin.size === 'square' ? 'border-muji-red bg-muji-soft text-muji-red font-bold' : 'border-muji-border'}">正方形 1080×1080</button>
-                </div>
-                <div class="grid grid-cols-2 gap-2">
-                  <button type="button" data-ck-theme="light" class="rounded-xl border px-3 py-2 font-medium ${state.checkin.theme === 'light' ? 'border-muji-red bg-muji-soft text-muji-red font-bold' : 'border-muji-border'}">無印米色</button>
-                  <button type="button" data-ck-theme="dark" class="rounded-xl border px-3 py-2 font-medium ${state.checkin.theme === 'dark' ? 'border-muji-red bg-muji-soft text-muji-red font-bold' : 'border-muji-border'}">沉穩深色</button>
-                </div>
-                <div class="flex items-center justify-between rounded-xl bg-muji-soft px-3 py-2 dark:bg-stone-800">
-                  <label class="flex items-center gap-2"><input type="checkbox" id="ck-w" ${state.checkin.showWeight ? 'checked' : ''} /> 顯示體重</label>
-                  <label class="flex items-center gap-2"><input type="checkbox" id="ck-f" ${state.checkin.showFood ? 'checked' : ''} /> 顯示飲食文字</label>
-                </div>
-                <button type="button" id="ck-share" class="w-full rounded-xl bg-muji-red py-3 text-sm font-bold text-white">使用 iPhone 分享圖片</button>
-              </div>
-            </div>
-          </div>`;
+      const currentTheme = state.settings.darkMode ? 'dark' : 'light';
+      const { blob, dataUrl } = await buildCheckinBlob(dateStr, {
+        size: 'square',
+        theme: currentTheme,
+        showWeight: true,
+        showFood: true
+      });
+      state.checkin.blob = blob;
+      state.checkin.dataUrl = dataUrl;
 
-        document.getElementById('ck-close').addEventListener('click', () => { root.innerHTML = ''; });
-        root.querySelectorAll('[data-ck-size]').forEach(b => b.addEventListener('click', () => { state.checkin.size = b.dataset.ckSize; renderModal(); }));
-        root.querySelectorAll('[data-ck-theme]').forEach(b => b.addEventListener('click', () => { state.checkin.theme = b.dataset.ckTheme; renderModal(); }));
-        document.getElementById('ck-w').addEventListener('change', (e) => { state.checkin.showWeight = e.target.checked; renderModal(); });
-        document.getElementById('ck-f').addEventListener('change', (e) => { state.checkin.showFood = e.target.checked; renderModal(); });
-        document.getElementById('ck-share').addEventListener('click', async () => {
-          const res = await shareOrDownload(state.checkin.blob, `health-checkin-${dateStr}-${state.checkin.size}.png`, '今日健康打卡');
-          if (res === 'shared') showToast('已開啟分享選單');
-          else if (res === 'downloaded') showToast('此瀏覽器不支援原生檔案分享，已改為儲存圖片（亦可長按預覽圖分享）');
-        });
-      };
-      await renderModal();
+      root.innerHTML = `
+        <div class="fixed inset-0 z-50 flex items-end justify-center bg-stone-900/70 sm:items-center sm:p-4">
+          <div class="max-h-[92dvh] w-full max-w-md overflow-y-auto rounded-t-3xl bg-muji-card p-5 shadow-xl dark:bg-stone-900 sm:rounded-3xl">
+            <div class="mb-3 flex items-center justify-between">
+              <h3 class="font-bold text-muji-red dark:text-red-300">今日打卡分享圖</h3>
+              <button type="button" id="ck-close" class="rounded-full px-2 py-1 text-sm text-muji-muted">✕</button>
+            </div>
+            <div class="mb-3 flex justify-center rounded-2xl border border-muji-border bg-muji-soft p-2 dark:border-stone-700 dark:bg-stone-800">
+              <img src="${dataUrl}" alt="今日健康打卡預覽圖" class="max-h-[55dvh] w-full rounded-xl object-contain shadow-sm" />
+            </div>
+            <p class="mb-3 text-center text-[11px] text-muji-muted">可直接點下方分享至 LINE / IG，或長按上方圖片儲存</p>
+            <button type="button" id="ck-share" class="w-full rounded-xl bg-muji-red py-3 text-sm font-bold text-white">使用 iPhone 分享圖片</button>
+          </div>
+        </div>`;
+
+      document.getElementById('ck-close').addEventListener('click', () => { root.innerHTML = ''; });
+      document.getElementById('ck-share').addEventListener('click', async () => {
+        const res = await shareOrDownload(state.checkin.blob, `health-checkin-${dateStr}.png`, '今日健康打卡');
+        if (res === 'shared') showToast('已開啟分享選單');
+        else if (res === 'downloaded') showToast('此瀏覽器不支援原生檔案分享，已改為儲存圖片（亦可長按預覽圖分享）');
+      });
     }
 
     function render() {
