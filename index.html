@@ -133,6 +133,15 @@
     function escHtml(s) {
       return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
     }
+    function renderDatePicker(id, value, max = '', extraClass = '') {
+      const display = value ? value.replace(/-/g, '/') : '年 / 月 / 日';
+      return `
+        <div class="relative flex items-center justify-between overflow-hidden rounded-xl border border-muji-border bg-muji-soft px-3 py-2 text-sm dark:border-stone-700 dark:bg-stone-800 ${extraClass}">
+          <span class="truncate font-medium ${value ? '' : 'text-muji-muted'}">${display}</span>
+          <span class="ml-2 shrink-0 text-xs text-muji-muted">▾</span>
+          <input type="date" id="${id}" value="${escHtml(value || '')}" ${max ? `max="${max}"` : ''} class="absolute inset-0 h-full w-full cursor-pointer opacity-0" />
+        </div>`;
+    }
 
     // ========= 2. Dexie.js IndexedDB 資料庫 =========
     const db = new Dexie('LightLogWeightTrackerDB');
@@ -422,7 +431,7 @@
                 <p class="text-xs font-medium text-muji-red dark:text-red-300">${d === today ? '今天' : '歷史檢視 / 補登'}</p>
                 <h2 class="text-lg font-bold">${d.replace(/-/g, '/')} ${getWeekdayLabel(d)}</h2>
               </div>
-              <input type="date" id="dash-date" value="${d}" max="${today}" class="rounded-xl border border-muji-border bg-muji-soft px-2.5 py-1.5 text-xs dark:border-stone-700 dark:bg-stone-800" />
+              ${renderDatePicker('dash-date', d, today, 'w-36 !py-1.5 !text-xs')}
             </div>
             <div class="flex items-end justify-between gap-4">
               <div>
@@ -597,7 +606,7 @@
             <h3 class="mb-3 font-bold">新增或補登體重</h3>
             <form id="w-add-form" class="space-y-3">
               <div class="grid grid-cols-1 gap-2.5 sm:grid-cols-2">
-                <label class="block min-w-0 text-xs">日期<input type="date" id="w-f-date" value="${today}" max="${today}" class="mt-1 w-full rounded-xl border border-muji-border bg-muji-soft px-3 py-2 text-sm dark:border-stone-700 dark:bg-stone-800" /></label>
+                <label class="block min-w-0 text-xs">日期<div class="mt-1">${renderDatePicker('w-f-date', today, today)}</div></label>
                 <label class="block min-w-0 text-xs">體重 (kg)<input type="number" id="w-f-val" inputmode="decimal" step="0.01" placeholder="68.25" class="mt-1 w-full rounded-xl border border-muji-border bg-muji-soft px-3 py-2 text-sm dark:border-stone-700 dark:bg-stone-800" /></label>
               </div>
               <div class="flex gap-2">
@@ -653,13 +662,18 @@
 
     function renderExerciseView(main) {
       const today = getTaipeiToday();
+      const d = state.selectedDate;
       const weekDates = getWeekDates(today);
       let scheduledUpToToday = 0, completedCount = 0;
-      weekDates.forEach(d => {
-        if (d <= today) scheduledUpToToday += getScheduledPlansForDate(d).length;
-        state.exerciseLogs.filter(l => l.date === d && l.completed).forEach(() => { completedCount++; });
+      weekDates.forEach(dt => {
+        if (dt <= today) scheduledUpToToday += getScheduledPlansForDate(dt).length;
+        state.exerciseLogs.filter(l => l.date === dt && l.completed).forEach(() => { completedCount++; });
       });
       const rate = scheduledUpToToday > 0 ? Math.min(100, Math.round((completedCount / scheduledUpToToday) * 100)) : null;
+
+      const dayItems = getCombinedExercises(d);
+      const dayBurnTotal = dayItems.filter(i => i.completed).reduce((s, i) => s + (i.calories ?? 0), 0);
+      const latestW = computeWeightStats().latestWeight;
 
       main.innerHTML = `
         <div class="space-y-4">
@@ -672,6 +686,47 @@
               <div class="text-xs text-muji-muted">本週完成率</div>
               <div class="mt-1 text-xl font-bold text-muji-red dark:text-red-300">${rate !== null ? rate + '%' : '--'}</div>
             </div>
+          </section>
+
+          <section class="rounded-2xl border border-muji-border bg-muji-card p-4 dark:border-stone-800 dark:bg-stone-900">
+            <div class="mb-3 flex flex-wrap items-center justify-between gap-2">
+              <div>
+                <h3 class="font-bold">每日運動消耗紀錄</h3>
+                <p class="text-xs text-muji-muted">當日已完成總消耗：<strong class="text-muji-red dark:text-red-300">${dayBurnTotal} kcal</strong></p>
+              </div>
+              ${renderDatePicker('ex-date', d, today, 'w-36 !py-1.5 !text-xs')}
+            </div>
+
+            ${dayItems.length === 0 ? `<p class="rounded-xl bg-muji-soft p-3 text-center text-xs text-muji-muted dark:bg-stone-800">此日期無排定運動，可在下方新增臨時運動或手環消耗</p>` : `
+              <div class="space-y-2.5">
+                ${dayItems.map(item => `
+                  <div class="rounded-xl border border-muji-border bg-muji-soft/60 p-3 dark:border-stone-800 dark:bg-stone-800/60">
+                    <div class="flex items-center justify-between gap-2">
+                      <button type="button" data-exv-toggle="${item.key}" class="flex items-center gap-2 text-left">
+                        <span class="flex h-5 w-5 shrink-0 items-center justify-center rounded border ${item.completed ? 'border-muji-red bg-muji-red text-white' : 'border-muji-brownLight bg-white dark:bg-stone-900'} text-xs">${item.completed ? '✓' : ''}</span>
+                        <span class="text-sm font-semibold ${item.completed ? '' : 'text-muji-muted'}">${escHtml(item.name)}</span>
+                      </button>
+                      ${item.log?.isAdHoc ? `<button type="button" data-exv-del="${item.log.id}" class="text-xs text-muji-red">刪除</button>` : ''}
+                    </div>
+                    <div class="mt-2.5 flex items-center gap-2 text-xs">
+                      <span class="text-muji-muted shrink-0">消耗 (kcal)：</span>
+                      <input type="number" inputmode="numeric" data-exv-cal="${item.key}" value="${item.calories ?? ''}" placeholder="輸入手環或機器數值" class="min-w-0 flex-1 rounded-lg border border-muji-border bg-white px-2.5 py-1.5 text-right text-sm dark:border-stone-700 dark:bg-stone-900" />
+                      <button type="button" data-exv-est="${item.key}" class="shrink-0 rounded-lg bg-muji-brown px-2.5 py-1.5 font-medium text-white">MET估算</button>
+                    </div>
+                  </div>
+                `).join('')}
+              </div>
+            `}
+
+            <form id="ex-adhoc-form" class="mt-4 space-y-2 border-t border-muji-border pt-3 dark:border-stone-800">
+              <div class="text-xs font-bold text-muji-brown dark:text-stone-300">快速補記臨時運動 / 手環消耗</div>
+              <div class="grid grid-cols-3 gap-2">
+                <input type="text" id="adhoc-name" placeholder="項目（如散步、手環動態消耗）" class="col-span-3 rounded-xl border border-muji-border bg-muji-soft px-3 py-2 text-sm dark:border-stone-700 dark:bg-stone-800" />
+                <input type="number" id="adhoc-min" inputmode="numeric" placeholder="分鐘" value="30" class="rounded-xl border border-muji-border bg-muji-soft px-3 py-2 text-sm dark:border-stone-700 dark:bg-stone-800" />
+                <input type="number" id="adhoc-cal" inputmode="numeric" placeholder="消耗 kcal" class="rounded-xl border border-muji-border bg-muji-soft px-3 py-2 text-sm dark:border-stone-700 dark:bg-stone-800" />
+                <button type="submit" class="rounded-xl bg-muji-red px-3 py-2 text-sm font-semibold text-white">記錄</button>
+              </div>
+            </form>
           </section>
 
           <section class="rounded-2xl border border-muji-border bg-muji-card p-4 dark:border-stone-800 dark:bg-stone-900">
@@ -692,13 +747,53 @@
               `).join('')}
             </div>
             <form id="plan-add-form" class="mt-4 flex gap-2 border-t border-muji-border pt-3 dark:border-stone-800">
-              <input type="text" id="plan-new-name" placeholder="新增運動項目（如慢跑）" class="flex-1 min-w-0 rounded-xl border border-muji-border bg-muji-soft px-3 py-2 text-sm dark:border-stone-700 dark:bg-stone-800" />
+              <input type="text" id="plan-new-name" placeholder="新增固定運動（如慢跑）" class="flex-1 min-w-0 rounded-xl border border-muji-border bg-muji-soft px-3 py-2 text-sm dark:border-stone-700 dark:bg-stone-800" />
               <input type="number" id="plan-new-min" inputmode="numeric" value="30" class="w-16 shrink-0 rounded-xl border border-muji-border bg-muji-soft px-2 py-2 text-center text-sm dark:border-stone-700 dark:bg-stone-800" />
               <button type="submit" class="shrink-0 rounded-xl bg-muji-red px-3.5 py-2 text-sm font-semibold text-white">新增</button>
             </form>
           </section>
         </div>
       `;
+
+      document.getElementById('ex-date').addEventListener('change', (e) => { if (e.target.value) { state.selectedDate = e.target.value; render(); } });
+      document.querySelectorAll('[data-exv-toggle]').forEach(btn => btn.addEventListener('click', () => {
+        const cur = dayItems.find(x => x.key === btn.dataset.exvToggle);
+        toggleExerciseItem(d, cur.key, { completed: !cur.completed });
+      }));
+      document.querySelectorAll('[data-exv-cal]').forEach(inp => inp.addEventListener('change', (e) => {
+        const raw = e.target.value.trim();
+        toggleExerciseItem(d, inp.dataset.exvCal, {
+          caloriesBurned: raw === '' ? null : Math.max(0, Math.round(Number(raw))),
+          caloriesIsEstimated: false,
+          completed: true
+        });
+      }));
+      document.querySelectorAll('[data-exv-est]').forEach(btn => btn.addEventListener('click', () => {
+        const cur = dayItems.find(x => x.key === btn.dataset.exvEst);
+        const met = cur.plan?.met ?? cur.log?.met ?? 5.0;
+        const est = estimateMetCalories(met, latestW, cur.minutes);
+        toggleExerciseItem(d, cur.key, { caloriesBurned: est, caloriesIsEstimated: true, completed: true });
+      }));
+      document.querySelectorAll('[data-exv-del]').forEach(btn => btn.addEventListener('click', async () => {
+        await db.exerciseLogs.delete(btn.dataset.exvDel);
+        await loadAllData(); render(); showToast('已刪除臨時運動紀錄');
+      }));
+      document.getElementById('ex-adhoc-form').addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const name = document.getElementById('adhoc-name').value.trim();
+        if (!name) return showToast('請輸入運動項目名稱');
+        const mins = Math.max(1, Number(document.getElementById('adhoc-min').value) || 30);
+        const rawCal = document.getElementById('adhoc-cal').value.trim();
+        const isEst = rawCal === '';
+        const cals = isEst ? estimateMetCalories(5.0, latestW, mins) : Math.max(0, Math.round(Number(rawCal)));
+        const now = new Date().toISOString();
+        await db.exerciseLogs.put({
+          id: `ex_${d}_adhoc_${Date.now()}`, date: d, planId: null, name, met: 5.0,
+          plannedMinutes: mins, actualMinutes: mins, completed: true,
+          caloriesBurned: cals, caloriesIsEstimated: isEst, note: '', isAdHoc: true, createdAt: now, updatedAt: now
+        });
+        await loadAllData(); render(); showToast('已記錄運動消耗');
+      });
 
       document.querySelectorAll('[data-plan-wd]').forEach(btn => btn.addEventListener('click', async () => {
         const [pid, wdStr] = btn.dataset.planWd.split(':');
@@ -734,7 +829,7 @@
         <div class="space-y-4">
           <section class="flex flex-wrap items-center justify-between gap-2 rounded-2xl border border-muji-border bg-muji-card p-4 dark:border-stone-800 dark:bg-stone-900">
             <div><div class="text-xs text-muji-muted">飲食紀錄日期</div><div class="font-bold">${d.replace(/-/g,'/')} ${getWeekdayLabel(d)}</div></div>
-            <input type="date" id="diet-date" value="${d}" max="${today}" class="rounded-xl border border-muji-border bg-muji-soft px-3 py-1.5 text-xs dark:border-stone-700 dark:bg-stone-800" />
+            ${renderDatePicker('diet-date', d, today, 'w-36 !py-1.5 !text-xs')}
           </section>
           <section class="grid grid-cols-2 gap-3">
             <div class="rounded-2xl border border-muji-border bg-muji-card p-3.5 dark:border-stone-800 dark:bg-stone-900"><div class="text-xs text-muji-muted">當日總攝取</div><div class="mt-1 text-lg font-bold">${cal.totalIntake !== null ? cal.totalIntake + ' kcal' : '未記錄'}</div></div>
@@ -773,7 +868,7 @@
                 <label class="block min-w-0">目標體重 (kg)<input type="number" step="0.01" id="set-targw" value="${s.targetWeight ?? ''}" class="mt-1 w-full rounded-xl border border-muji-border bg-muji-soft px-3 py-2 text-sm dark:border-stone-700 dark:bg-stone-800" /></label>
               </div>
               <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
-                <label class="block min-w-0">目標日期 (年/月/日)<input type="date" id="set-targd" value="${s.targetDate ?? ''}" class="mt-1 w-full rounded-xl border border-muji-border bg-muji-soft px-3 py-2 text-sm dark:border-stone-700 dark:bg-stone-800" /></label>
+                <label class="block min-w-0">目標日期 (年/月/日)<div class="mt-1">${renderDatePicker('set-targd', s.targetDate ?? '')}</div></label>
                 <label class="block min-w-0">每日熱量目標 (kcal)<input type="number" inputmode="numeric" id="set-cal" value="${s.dailyCalorieTarget}" class="mt-1 w-full rounded-xl border border-muji-border bg-muji-soft px-3 py-2 text-sm dark:border-stone-700 dark:bg-stone-800" /></label>
               </div>
               <button type="submit" class="w-full rounded-xl bg-muji-red py-3 text-sm font-semibold text-white hover:bg-muji-redHover">儲存目標設定</button>
