@@ -70,7 +70,7 @@
     <header class="shrink-0 z-30 border-b border-muji-border bg-muji-card/95 px-4 py-3 backdrop-blur-md dark:border-stone-800 dark:bg-stone-900/95">
       <div class="mx-auto flex max-w-3xl items-center justify-between">
         <h1 class="text-lg font-bold tracking-wide text-muji-red dark:text-red-300">輕盈日誌</h1>
-        <span class="text-xs text-muji-muted dark:text-stone-400">本機離線保存</span>
+        <button type="button" id="header-backup-btn" class="rounded-lg border border-muji-border bg-muji-soft px-3 py-1 text-xs font-semibold text-muji-brown hover:bg-muji-border/50 dark:border-stone-700 dark:bg-stone-800 dark:text-stone-200">備份</button>
       </div>
     </header>
 
@@ -173,6 +173,7 @@
       targetWeight: null,
       targetDate: null,
       dailyCalorieTarget: 1800,
+      bmrCalories: null,
       darkMode: false,
       lastBackupConfirmedAt: null,
       lastBackupGeneratedAt: null,
@@ -299,17 +300,42 @@
       return list;
     }
 
+    function getRestingEnergy(dateStr) {
+      const ov = state.exerciseOverrides.find(o => o.date === dateStr);
+      return ov?.restingCalories ?? null;
+    }
+
     function computeDailyCalorieSummary(dateStr) {
       const mealLog = state.mealLogs.find(m => m.date === dateStr);
       const exLogs = state.exerciseLogs.filter(l => l.date === dateStr && l.completed);
       const target = mealLog?.targetCaloriesSnapshot ?? state.settings.dailyCalorieTarget;
       const exerciseBurned = exLogs.reduce((s, l) => s + (l.caloriesBurned ?? 0), 0);
-      if (!mealLog) return { totalIntake: null, targetCalories: target, remainingQuota: null, exerciseBurned, netAfterExercise: null };
+      const restingEnergy = getRestingEnergy(dateStr);
+      const bmr = state.settings.bmrCalories ?? null;
+      if (!mealLog) {
+        return {
+          totalIntake: null, targetCalories: target, remainingQuota: null,
+          exerciseBurned, restingEnergy, netAfterAll: null, intakeMinusBmr: null, totalProtein: null
+        };
+      }
       const vals = [mealLog.breakfast.calories, mealLog.lunch.calories, mealLog.dinner.calories, mealLog.other.calories]
         .filter(v => v !== null && !Number.isNaN(v));
-      if (!vals.length) return { totalIntake: null, targetCalories: target, remainingQuota: null, exerciseBurned, netAfterExercise: null };
+      const pVals = [mealLog.breakfast.protein, mealLog.lunch.protein, mealLog.dinner.protein, mealLog.other.protein]
+        .filter(v => v !== null && v !== undefined && !Number.isNaN(v));
+      const totalProtein = pVals.length ? round2(pVals.reduce((a, b) => a + b, 0)) : null;
+      if (!vals.length) {
+        return {
+          totalIntake: null, targetCalories: target, remainingQuota: null,
+          exerciseBurned, restingEnergy, netAfterAll: null, intakeMinusBmr: null, totalProtein
+        };
+      }
       const totalIntake = vals.reduce((a, b) => a + b, 0);
-      return { totalIntake, targetCalories: target, remainingQuota: target - totalIntake, exerciseBurned, netAfterExercise: totalIntake - exerciseBurned };
+      const netAfterAll = totalIntake - exerciseBurned - (restingEnergy ?? 0);
+      const intakeMinusBmr = bmr !== null ? totalIntake - bmr : null;
+      return {
+        totalIntake, targetCalories: target, remainingQuota: target - totalIntake,
+        exerciseBurned, restingEnergy, netAfterAll, intakeMinusBmr, totalProtein
+      };
     }
 
     function estimateMetCalories(met, weightKg, mins) {
@@ -326,6 +352,17 @@
           await db.weightLogs.put({ id: `w_${date}`, date, weight, note, createdAt: existing?.createdAt ?? now, updatedAt: now });
         });
         await loadAllData();
+        document.getElementById('header-backup-btn')?.addEventListener('click', async () => {
+          const payload = {
+            app: 'light-log-weight-tracker', schemaVersion: 1, backupVersion: '1.0.0', exportedAt: new Date().toISOString(),
+            data: { settings: await db.settings.toArray(), weightLogs: await db.weightLogs.toArray(), mealLogs: await db.mealLogs.toArray(), exercisePlans: await db.exercisePlans.toArray(), exerciseOverrides: await db.exerciseOverrides.toArray(), exerciseLogs: await db.exerciseLogs.toArray() }
+          };
+          const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+          await shareOrDownload(blob, `weight-backup-${formatTaipeiFilenameTs()}.json`, '輕盈日誌備份');
+          await db.settings.put({ ...state.settings, lastBackupGeneratedAt: new Date().toISOString(), updatedAt: new Date().toISOString() });
+          await loadAllData();
+          showToast('已產生備份檔');
+        });
         render();
         showToast('體重已儲存');
       } catch (err) {
@@ -343,6 +380,7 @@
         };
         const nextEntry = { ...base[mealKey] };
         if (field === 'food') nextEntry.food = rawVal;
+        else if (field === 'protein') nextEntry.protein = rawVal.trim() === '' ? null : Math.max(0, Math.round(Number(rawVal) * 10) / 10);
         else nextEntry.calories = rawVal.trim() === '' ? null : Math.max(0, Math.round(Number(rawVal)));
         base[mealKey] = nextEntry;
         base.updatedAt = new Date().toISOString();
@@ -523,52 +561,33 @@
       const d = state.selectedDate;
       const wStats = computeWeightStats();
       const wLog = state.weightLogs.find(w => w.date === d);
-      const mLog = state.mealLogs.find(m => m.date === d);
-      const exItems = getCombinedExercises(d);
       const cal = computeDailyCalorieSummary(d);
       const isOver = cal.remainingQuota !== null && cal.remainingQuota < 0;
       const ratio = cal.totalIntake !== null && cal.targetCalories > 0 ? Math.min(100, Math.round((cal.totalIntake / cal.targetCalories) * 100)) : 0;
-
-      const daysSinceBackup = state.settings.lastBackupConfirmedAt
-        ? diffDays(state.settings.lastBackupConfirmedAt.slice(0, 10), today) : null;
-      const needReminder = daysSinceBackup === null
-        ? (state.weightLogs.length + state.mealLogs.length + state.exerciseLogs.length >= 3)
-        : daysSinceBackup >= state.settings.backupReminderDays;
+      const bmr = state.settings.bmrCalories;
+      const belowBmr = cal.intakeMinusBmr !== null && cal.intakeMinusBmr < 0;
 
       main.innerHTML = `
         <div class="space-y-4">
-          ${needReminder ? `
-            <div class="flex items-center justify-between gap-3 rounded-2xl border border-muji-border bg-muji-soft px-4 py-3 text-xs text-muji-brown dark:border-stone-700 dark:bg-stone-800 dark:text-stone-200">
-              <span>${daysSinceBackup === null ? '建議定期匯出 JSON 備份，確保本機資料安全。' : `距離上次確認備份已過 ${daysSinceBackup} 天，建議匯出備份。`}</span>
-              <button type="button" id="btn-go-backup" class="shrink-0 rounded-xl bg-muji-red px-3 py-1.5 font-semibold text-white">前往備份</button>
-            </div>` : ''}
-
           <section class="rounded-2xl border border-muji-border bg-muji-card p-5 dark:border-stone-800 dark:bg-stone-900">
             <div class="mb-3 flex flex-wrap items-center justify-between gap-2">
               <div>
-                <p class="text-xs font-medium text-muji-red dark:text-red-300">${d === today ? '今天' : '歷史檢視 / 補登'}</p>
+                <p class="text-xs font-medium text-muji-red dark:text-red-300">${d === today ? '今天' : '歷史檢視'}</p>
                 <h2 class="text-lg font-bold">${d.replace(/-/g, '/')} ${getWeekdayLabel(d)}</h2>
               </div>
               ${renderDatePicker('dash-date', d, today, 'w-36 !py-1.5 !text-xs')}
             </div>
-            <div class="flex items-end justify-between gap-4">
-              <div>
-                <span class="text-xs text-muji-muted">空腹體重</span>
-                <div class="mt-0.5 flex items-baseline gap-2">
-                  <span class="text-3xl font-extrabold text-muji-red dark:text-red-300">${wLog ? wLog.weight.toFixed(2) : '--'}</span>
-                  <span class="text-sm text-muji-muted">kg</span>
-                </div>
-                <div class="mt-1.5 flex flex-wrap gap-3 text-xs text-muji-muted">
-                  <span>較上筆：${wStats.deltaFromPrevious !== null ? (wStats.deltaFromPrevious > 0 ? '+' : '') + wStats.deltaFromPrevious.toFixed(2) + ' kg' : '尚無對比'}</span>
-                  <span>距目標：${wStats.remainingToTarget !== null ? (wStats.remainingToTarget > 0 ? '還差 ' : '已超越 ') + Math.abs(wStats.remainingToTarget).toFixed(2) + ' kg' : '未設定'}</span>
-                </div>
+            <div>
+              <span class="text-xs text-muji-muted">空腹體重</span>
+              <div class="mt-0.5 flex items-baseline gap-2">
+                <span class="text-3xl font-extrabold text-muji-red dark:text-red-300">${wLog ? wLog.weight.toFixed(2) : '--'}</span>
+                <span class="text-sm text-muji-muted">kg</span>
               </div>
-              <button type="button" id="btn-toggle-w" class="rounded-xl bg-muji-red px-4 py-2.5 text-sm font-semibold text-white hover:bg-muji-redHover">${wLog ? '修改體重' : '快速輸入'}</button>
+              <div class="mt-1.5 flex flex-wrap gap-3 text-xs text-muji-muted">
+                <span>較上筆：${wStats.deltaFromPrevious !== null ? (wStats.deltaFromPrevious > 0 ? '+' : '') + wStats.deltaFromPrevious.toFixed(2) + ' kg' : '尚無對比'}</span>
+                <span>距目標：${wStats.remainingToTarget !== null ? (wStats.remainingToTarget > 0 ? '還差 ' : '已超越 ') + Math.abs(wStats.remainingToTarget).toFixed(2) + ' kg' : '未設定'}</span>
+              </div>
             </div>
-            <form id="dash-w-form" class="mt-4 hidden gap-2">
-              <input type="number" id="dash-w-input" inputmode="decimal" step="0.01" placeholder="例如 68.45" value="${wLog ? wLog.weight : ''}" class="w-full rounded-xl border border-muji-border bg-muji-soft px-3 py-2 text-base dark:border-stone-700 dark:bg-stone-800" />
-              <button type="submit" class="shrink-0 rounded-xl bg-muji-brown px-4 py-2 text-sm font-semibold text-white">儲存</button>
-            </form>
           </section>
 
           <section class="rounded-2xl border border-muji-border bg-muji-card p-5 dark:border-stone-800 dark:bg-stone-900">
@@ -576,68 +595,49 @@
               <h3 class="font-bold">今日熱量管理</h3>
               <span class="text-xs text-muji-muted">目標 ${cal.targetCalories} kcal</span>
             </div>
-            <div class="grid grid-cols-2 gap-3 sm:grid-cols-4">
-              <div class="rounded-xl bg-muji-soft p-3 dark:bg-stone-800"><div class="text-xs text-muji-muted">今日攝取</div><div class="mt-1 text-xl font-bold">${cal.totalIntake !== null ? cal.totalIntake : '未記錄'}</div></div>
-              <div class="rounded-xl bg-muji-soft p-3 dark:bg-stone-800"><div class="text-xs text-muji-muted">剩餘攝取額度</div><div class="mt-1 text-xl font-bold text-muji-red dark:text-red-300">${cal.remainingQuota !== null ? cal.remainingQuota : '未記錄'}</div></div>
-              <div class="rounded-xl bg-muji-soft p-3 dark:bg-stone-800"><div class="text-xs text-muji-muted">運動消耗</div><div class="mt-1 text-xl font-bold">${cal.exerciseBurned}</div></div>
-              <div class="rounded-xl bg-muji-soft p-3 dark:bg-stone-800"><div class="text-xs text-muji-muted">攝取−運動差額</div><div class="mt-1 text-xl font-bold">${cal.netAfterExercise !== null ? cal.netAfterExercise : '未記錄'}</div></div>
+            <div class="grid grid-cols-2 gap-3 sm:grid-cols-3">
+              <div class="rounded-xl bg-muji-soft p-3 dark:bg-stone-800">
+                <div class="text-xs text-muji-muted">今日攝取</div>
+                <div class="mt-1 text-xl font-bold">${cal.totalIntake !== null ? cal.totalIntake : '未記錄'}</div>
+              </div>
+              <div class="rounded-xl bg-muji-soft p-3 dark:bg-stone-800">
+                <div class="text-xs text-muji-muted">剩餘攝取額度</div>
+                <div class="mt-1 text-xl font-bold text-muji-red dark:text-red-300">${cal.remainingQuota !== null ? cal.remainingQuota : '未記錄'}</div>
+              </div>
+              <div class="rounded-xl bg-muji-soft p-3 dark:bg-stone-800">
+                <div class="text-xs text-muji-muted">動態能量</div>
+                <div class="mt-1 text-xl font-bold">${cal.exerciseBurned}</div>
+              </div>
+              <div class="rounded-xl bg-muji-soft p-3 dark:bg-stone-800">
+                <div class="text-xs text-muji-muted">靜態能量</div>
+                <div class="mt-1 text-xl font-bold">${cal.restingEnergy !== null ? cal.restingEnergy : '未記錄'}</div>
+              </div>
+              <div class="rounded-xl bg-muji-soft p-3 dark:bg-stone-800">
+                <div class="text-xs text-muji-muted">攝取−動態−靜態</div>
+                <div class="mt-1 text-xl font-bold">${cal.netAfterAll !== null ? cal.netAfterAll : '未記錄'}</div>
+              </div>
+              <div class="rounded-xl bg-muji-soft p-3 dark:bg-stone-800">
+                <div class="text-xs text-muji-muted">今日蛋白質</div>
+                <div class="mt-1 text-xl font-bold text-muji-brown dark:text-stone-200">${cal.totalProtein !== null ? cal.totalProtein + ' g' : '未記錄'}</div>
+              </div>
             </div>
+
+            <div class="mt-3 rounded-xl border ${belowBmr ? 'border-amber-300 bg-amber-50 dark:border-amber-800 dark:bg-amber-950/40' : 'border-muji-border bg-muji-soft dark:border-stone-700 dark:bg-stone-800'} p-3.5">
+              <div class="flex items-center justify-between">
+                <span class="text-xs font-semibold text-muji-brown dark:text-stone-300">攝取熱量 − 基礎代謝</span>
+                <span class="text-lg font-extrabold ${belowBmr ? 'text-amber-700 dark:text-amber-300' : 'text-muji-red dark:text-red-300'}">
+                  ${bmr === null ? '未設定基礎代謝' : cal.intakeMinusBmr === null ? '未記錄' : (cal.intakeMinusBmr >= 0 ? '+' : '') + cal.intakeMinusBmr + ' kcal'}
+                </span>
+              </div>
+              <p class="mt-1 text-[11px] ${belowBmr ? 'text-amber-800 dark:text-amber-200 font-medium' : 'text-muji-muted'}">
+                ${bmr === null ? '請至「設定」頁面填寫基礎代謝，即可在此追蹤是否吃足基礎代謝。' : belowBmr ? `目前低於基礎代謝 (${bmr} kcal)，一定要吃超過基礎代謝喔！` : `已高於基礎代謝 (${bmr} kcal)，維持穩健營養攝取。`}
+              </p>
+            </div>
+
             <div class="mt-3">
               <div class="h-2 w-full overflow-hidden rounded-full bg-muji-soft dark:bg-stone-800"><div class="h-full rounded-full ${isOver ? 'bg-muji-red' : 'bg-muji-brown'}" style="width:${ratio}%"></div></div>
-              <p class="mt-2 text-[11px] text-muji-muted">${isOver ? '今日攝取已略高於設定目標，明天再穩健調整即可。' : '註：「攝取−運動差額」未計入基礎代謝與日常活動，不等於實際熱量盈餘或赤字；運動消耗亦不建議全數吃回。'}</p>
+              <p class="mt-2 text-[11px] text-muji-muted">${isOver ? '今日攝取已略高於設定目標，明天再穩健調整即可。' : '提示：請由下方「體重 / 運動 / 飲食」分頁輸入每日紀錄，首頁專注呈現總覽。'}</p>
             </div>
-          </section>
-
-          <section class="rounded-2xl border border-muji-border bg-muji-card p-5 dark:border-stone-800 dark:bg-stone-900">
-            <div class="mb-3 flex items-center justify-between">
-              <h3 class="font-bold">今日運動清單</h3>
-              <span class="text-xs text-muji-muted">已完成 ${exItems.filter(e => e.completed).length} / ${exItems.length}</span>
-            </div>
-            ${exItems.length === 0 ? `<p class="rounded-xl bg-muji-soft p-4 text-center text-sm text-muji-muted dark:bg-stone-800">今日未排定運動或設為休息日</p>` : `
-              <div class="space-y-2.5">
-                ${exItems.map(item => `
-                  <div class="rounded-xl border border-muji-border bg-muji-soft/60 p-3 dark:border-stone-800 dark:bg-stone-800/60">
-                    <div class="flex items-center justify-between gap-2">
-                      <button type="button" data-ex-toggle="${item.key}" class="flex flex-1 items-center gap-2.5 text-left">
-                        <span class="flex h-5 w-5 items-center justify-center rounded border ${item.completed ? 'border-muji-red bg-muji-red text-white' : 'border-muji-brownLight bg-white dark:bg-stone-900'} text-xs">${item.completed ? '✓' : ''}</span>
-                        <div>
-                          <div class="font-semibold ${item.completed ? 'line-through text-muji-muted' : ''}">${escHtml(item.name)}</div>
-                          <div class="text-xs text-muji-muted">${item.minutes} 分鐘${item.calories !== null ? ` • ${item.calories} kcal${item.isEstimated ? ' (估算值)' : ''}` : ''}</div>
-                        </div>
-                      </button>
-                      <button type="button" data-ex-expand="${item.key}" class="rounded-lg px-2.5 py-1 text-xs font-medium text-muji-red dark:text-red-300">${state.expandedExKey === item.key ? '收合' : '調整'}</button>
-                    </div>
-                    ${state.expandedExKey === item.key ? `
-                      <div class="mt-3 grid grid-cols-2 gap-2 border-t border-muji-border pt-3 text-xs dark:border-stone-700">
-                        <label>實際分鐘數<input type="number" inputmode="numeric" data-ex-min="${item.key}" value="${item.minutes}" class="mt-1 w-full rounded-lg border border-muji-border bg-white px-2.5 py-1.5 dark:border-stone-700 dark:bg-stone-900" /></label>
-                        <label>消耗熱量 (kcal)
-                          <div class="mt-1 flex gap-1">
-                            <input type="number" inputmode="numeric" data-ex-cal="${item.key}" value="${item.calories ?? ''}" placeholder="手動或估算" class="w-full rounded-lg border border-muji-border bg-white px-2.5 py-1.5 dark:border-stone-700 dark:bg-stone-900" />
-                            <button type="button" data-ex-est="${item.key}" class="shrink-0 rounded-lg bg-muji-brown px-2 py-1.5 font-medium text-white">估算</button>
-                          </div>
-                        </label>
-                      </div>
-                    ` : ''}
-                  </div>
-                `).join('')}
-              </div>
-            `}
-          </section>
-
-          <section class="space-y-2.5">
-            <h3 class="px-1 font-bold">今日三餐快速紀錄</h3>
-            ${[['breakfast','早餐'],['lunch','午餐'],['dinner','晚餐'],['other','其他飲食 (選填)']].map(([k, label]) => {
-              const entry = mLog?.[k];
-              return `
-                <div class="rounded-2xl border border-muji-border bg-muji-card p-3.5 dark:border-stone-800 dark:bg-stone-900">
-                  <div class="mb-2 flex items-center justify-between"><span class="text-sm font-bold">${label}</span><span class="text-xs font-semibold text-muji-red dark:text-red-300">${entry?.calories !== null && entry?.calories !== undefined ? entry.calories + ' kcal' : '未記錄'}</span></div>
-                  <div class="flex gap-2">
-                    <input type="text" data-meal-food="${k}" value="${escHtml(entry?.food ?? '')}" placeholder="吃了什麼？" class="flex-1 min-w-0 rounded-xl border border-muji-border bg-muji-soft px-3 py-2 text-sm dark:border-stone-700 dark:bg-stone-800" />
-                    <input type="number" inputmode="numeric" data-meal-cal="${k}" value="${entry?.calories ?? ''}" placeholder="kcal" class="w-24 shrink-0 rounded-xl border border-muji-border bg-muji-soft px-3 py-2 text-right text-sm dark:border-stone-700 dark:bg-stone-800" />
-                  </div>
-                </div>
-              `;
-            }).join('')}
           </section>
 
           <button type="button" id="btn-open-checkin" class="w-full rounded-2xl bg-muji-red px-5 py-4 text-base font-bold text-white shadow-sm hover:bg-muji-redHover">
@@ -646,43 +646,7 @@
         </div>
       `;
 
-      document.getElementById('btn-go-backup')?.addEventListener('click', () => { state.tab = 'settings'; render(); });
       document.getElementById('dash-date').addEventListener('change', (e) => { if (e.target.value) { state.selectedDate = e.target.value; render(); } });
-      document.getElementById('btn-toggle-w').addEventListener('click', () => {
-        const f = document.getElementById('dash-w-form');
-        f.classList.toggle('hidden'); f.classList.toggle('flex');
-      });
-      document.getElementById('dash-w-form').addEventListener('submit', (e) => {
-        e.preventDefault();
-        const val = parseFloat(document.getElementById('dash-w-input').value);
-        if (Number.isNaN(val) || val < 20 || val > 300) return showToast('請輸入有效體重 (20–300 kg)');
-        saveWeight(d, round2(val));
-      });
-      document.querySelectorAll('[data-ex-toggle]').forEach(btn => btn.addEventListener('click', () => {
-        const key = btn.dataset.exToggle;
-        const cur = exItems.find(x => x.key === key);
-        toggleExerciseItem(d, key, { completed: !cur.completed });
-      }));
-      document.querySelectorAll('[data-ex-expand]').forEach(btn => btn.addEventListener('click', () => {
-        const key = btn.dataset.exExpand;
-        state.expandedExKey = state.expandedExKey === key ? null : key;
-        render();
-      }));
-      document.querySelectorAll('[data-ex-min]').forEach(inp => inp.addEventListener('change', (e) => {
-        toggleExerciseItem(d, inp.dataset.exMin, { actualMinutes: Math.max(0, Number(e.target.value) || 0) });
-      }));
-      document.querySelectorAll('[data-ex-cal]').forEach(inp => inp.addEventListener('change', (e) => {
-        const raw = e.target.value.trim();
-        toggleExerciseItem(d, inp.dataset.exCal, { caloriesBurned: raw === '' ? null : Math.max(0, Number(raw)), caloriesIsEstimated: false });
-      }));
-      document.querySelectorAll('[data-ex-est]').forEach(btn => btn.addEventListener('click', () => {
-        const cur = exItems.find(x => x.key === btn.dataset.exEst);
-        const met = cur.plan?.met ?? cur.log?.met ?? 5.0;
-        const est = estimateMetCalories(met, wStats.latestWeight, cur.minutes);
-        toggleExerciseItem(d, btn.dataset.exEst, { caloriesBurned: est, caloriesIsEstimated: true });
-      }));
-      document.querySelectorAll('[data-meal-food]').forEach(inp => inp.addEventListener('change', (e) => saveMealField(d, inp.dataset.mealFood, 'food', e.target.value)));
-      document.querySelectorAll('[data-meal-cal]').forEach(inp => inp.addEventListener('change', (e) => saveMealField(d, inp.dataset.mealCal, 'calories', e.target.value)));
       document.getElementById('btn-open-checkin').addEventListener('click', () => openCheckinModal(d));
     }
 
@@ -814,7 +778,7 @@
 
       const dayItems = getCombinedExercises(d);
       const dayBurnTotal = dayItems.filter(i => i.completed).reduce((s, i) => s + (i.calories ?? 0), 0);
-      const latestW = computeWeightStats().latestWeight;
+      const restingEnergy = getRestingEnergy(d);
 
       main.innerHTML = `
         <div class="space-y-4">
@@ -855,13 +819,20 @@
           <section class="rounded-2xl border border-muji-border bg-muji-card p-4 dark:border-stone-800 dark:bg-stone-900">
             <div class="mb-3 flex flex-wrap items-center justify-between gap-2">
               <div>
-                <h3 class="font-bold">每日運動消耗紀錄</h3>
-                <p class="text-xs text-muji-muted">當日已完成總消耗：<strong class="text-muji-red dark:text-red-300">${dayBurnTotal} kcal</strong></p>
+                <h3 class="font-bold">每日能量消耗紀錄</h3>
+                <p class="text-xs text-muji-muted">當日動態能量：<strong class="text-muji-red dark:text-red-300">${dayBurnTotal} kcal</strong></p>
               </div>
               ${renderDatePicker('ex-date', d, today, 'w-36 !py-1.5 !text-xs')}
             </div>
 
-            ${dayItems.length === 0 ? `<p class="rounded-xl bg-muji-soft p-3 text-center text-xs text-muji-muted dark:bg-stone-800">此日期無排定運動，可在下方新增臨時運動或手環消耗</p>` : `
+            <div class="mb-3 rounded-xl border border-muji-border bg-muji-soft p-3 dark:border-stone-700 dark:bg-stone-800">
+              <label class="flex items-center justify-between gap-3 text-xs">
+                <span class="shrink-0 font-bold text-muji-brown dark:text-stone-200">當日靜態能量 (kcal)</span>
+                <input type="number" inputmode="numeric" id="ex-resting-cal" value="${restingEnergy ?? ''}" placeholder="輸入 Apple Watch 靜態能量" class="min-w-0 w-44 rounded-lg border border-muji-border bg-white px-2.5 py-1.5 text-right text-sm dark:border-stone-600 dark:bg-stone-900" />
+              </label>
+            </div>
+
+            ${dayItems.length === 0 ? `<p class="rounded-xl bg-muji-soft p-3 text-center text-xs text-muji-muted dark:bg-stone-800">此日期無排定運動，可在下方新增臨時運動</p>` : `
               <div class="space-y-2.5">
                 ${dayItems.map(item => `
                   <div class="rounded-xl border border-muji-border bg-muji-soft/60 p-3 dark:border-stone-800 dark:bg-stone-800/60">
@@ -873,9 +844,8 @@
                       ${item.log?.isAdHoc ? `<button type="button" data-exv-del="${item.log.id}" class="text-xs text-muji-red">刪除</button>` : ''}
                     </div>
                     <div class="mt-2.5 flex items-center gap-2 text-xs">
-                      <span class="text-muji-muted shrink-0">消耗 (kcal)：</span>
+                      <span class="text-muji-muted shrink-0">動態消耗 (kcal)：</span>
                       <input type="number" inputmode="numeric" data-exv-cal="${item.key}" value="${item.calories ?? ''}" placeholder="輸入手環或機器數值" class="min-w-0 flex-1 rounded-lg border border-muji-border bg-white px-2.5 py-1.5 text-right text-sm dark:border-stone-700 dark:bg-stone-900" />
-                      <button type="button" data-exv-est="${item.key}" class="shrink-0 rounded-lg bg-muji-brown px-2.5 py-1.5 font-medium text-white">MET估算</button>
                     </div>
                   </div>
                 `).join('')}
@@ -883,9 +853,9 @@
             `}
 
             <form id="ex-adhoc-form" class="mt-4 space-y-2 border-t border-muji-border pt-3 dark:border-stone-800">
-              <div class="text-xs font-bold text-muji-brown dark:text-stone-300">快速補記臨時運動 / 手環消耗</div>
+              <div class="text-xs font-bold text-muji-brown dark:text-stone-300">快速補記臨時運動 / 動態消耗</div>
               <div class="grid grid-cols-3 gap-2">
-                <input type="text" id="adhoc-name" placeholder="項目（如散步、手環動態消耗）" class="col-span-3 rounded-xl border border-muji-border bg-muji-soft px-3 py-2 text-sm dark:border-stone-700 dark:bg-stone-800" />
+                <input type="text" id="adhoc-name" placeholder="項目（如散步、跑步）" class="col-span-3 rounded-xl border border-muji-border bg-muji-soft px-3 py-2 text-sm dark:border-stone-700 dark:bg-stone-800" />
                 <input type="number" id="adhoc-min" inputmode="numeric" placeholder="分鐘" value="30" class="rounded-xl border border-muji-border bg-muji-soft px-3 py-2 text-sm dark:border-stone-700 dark:bg-stone-800" />
                 <input type="number" id="adhoc-cal" inputmode="numeric" placeholder="消耗 kcal" class="rounded-xl border border-muji-border bg-muji-soft px-3 py-2 text-sm dark:border-stone-700 dark:bg-stone-800" />
                 <button type="submit" class="rounded-xl bg-muji-red px-3 py-2 text-sm font-semibold text-white">記錄</button>
@@ -936,6 +906,19 @@
       });
 
       document.getElementById('ex-date').addEventListener('change', (e) => { if (e.target.value) { state.selectedDate = e.target.value; render(); } });
+      document.getElementById('ex-resting-cal').addEventListener('change', async (e) => {
+        const raw = e.target.value.trim();
+        const val = raw === '' ? null : Math.max(0, Math.round(Number(raw)));
+        const existingOv = await db.exerciseOverrides.get(`ov_${d}`);
+        await db.exerciseOverrides.put({
+          id: `ov_${d}`, date: d,
+          isRestDay: existingOv?.isRestDay ?? false,
+          customPlanIds: existingOv?.customPlanIds ?? null,
+          restingCalories: val,
+          updatedAt: new Date().toISOString()
+        });
+        await loadAllData(); render(); showToast('靜態能量已儲存');
+      });
       document.querySelectorAll('[data-exv-toggle]').forEach(btn => btn.addEventListener('click', () => {
         const cur = dayItems.find(x => x.key === btn.dataset.exvToggle);
         toggleExerciseItem(d, cur.key, { completed: !cur.completed });
@@ -948,12 +931,6 @@
           completed: true
         });
       }));
-      document.querySelectorAll('[data-exv-est]').forEach(btn => btn.addEventListener('click', () => {
-        const cur = dayItems.find(x => x.key === btn.dataset.exvEst);
-        const met = cur.plan?.met ?? cur.log?.met ?? 5.0;
-        const est = estimateMetCalories(met, latestW, cur.minutes);
-        toggleExerciseItem(d, cur.key, { caloriesBurned: est, caloriesIsEstimated: true, completed: true });
-      }));
       document.querySelectorAll('[data-exv-del]').forEach(btn => btn.addEventListener('click', async () => {
         await db.exerciseLogs.delete(btn.dataset.exvDel);
         await loadAllData(); render(); showToast('已刪除臨時運動紀錄');
@@ -964,13 +941,12 @@
         if (!name) return showToast('請輸入運動項目名稱');
         const mins = Math.max(1, Number(document.getElementById('adhoc-min').value) || 30);
         const rawCal = document.getElementById('adhoc-cal').value.trim();
-        const isEst = rawCal === '';
-        const cals = isEst ? estimateMetCalories(5.0, latestW, mins) : Math.max(0, Math.round(Number(rawCal)));
+        const cals = rawCal === '' ? null : Math.max(0, Math.round(Number(rawCal)));
         const now = new Date().toISOString();
         await db.exerciseLogs.put({
           id: `ex_${d}_adhoc_${Date.now()}`, date: d, planId: null, name, met: 5.0,
           plannedMinutes: mins, actualMinutes: mins, completed: true,
-          caloriesBurned: cals, caloriesIsEstimated: isEst, note: '', isAdHoc: true, createdAt: now, updatedAt: now
+          caloriesBurned: cals, caloriesIsEstimated: false, note: '', isAdHoc: true, createdAt: now, updatedAt: now
         });
         await loadAllData(); render(); showToast('已記錄運動消耗');
       });
@@ -1018,9 +994,10 @@
             <div><div class="text-xs text-muji-muted">飲食紀錄日期</div><div class="font-bold">${d.replace(/-/g,'/')} ${getWeekdayLabel(d)}</div></div>
             ${renderDatePicker('diet-date', d, today, 'w-36 !py-1.5 !text-xs')}
           </section>
-          <section class="grid grid-cols-2 gap-3">
-            <div class="rounded-2xl border border-muji-border bg-muji-card p-3.5 dark:border-stone-800 dark:bg-stone-900"><div class="text-xs text-muji-muted">當日總攝取</div><div class="mt-1 text-lg font-bold">${cal.totalIntake !== null ? cal.totalIntake + ' kcal' : '未記錄'}</div></div>
-            <div class="rounded-2xl border border-muji-border bg-muji-card p-3.5 dark:border-stone-800 dark:bg-stone-900"><div class="text-xs text-muji-muted">剩餘額度</div><div class="mt-1 text-lg font-bold text-muji-red dark:text-red-300">${cal.remainingQuota !== null ? cal.remainingQuota + ' kcal' : '未記錄'}</div></div>
+          <section class="grid grid-cols-3 gap-2.5">
+            <div class="rounded-2xl border border-muji-border bg-muji-card p-3 dark:border-stone-800 dark:bg-stone-900"><div class="text-[11px] text-muji-muted">當日總攝取</div><div class="mt-1 text-base font-bold">${cal.totalIntake !== null ? cal.totalIntake + ' kcal' : '未記錄'}</div></div>
+            <div class="rounded-2xl border border-muji-border bg-muji-card p-3 dark:border-stone-800 dark:bg-stone-900"><div class="text-[11px] text-muji-muted">剩餘額度</div><div class="mt-1 text-base font-bold text-muji-red dark:text-red-300">${cal.remainingQuota !== null ? cal.remainingQuota + ' kcal' : '未記錄'}</div></div>
+            <div class="rounded-2xl border border-muji-border bg-muji-card p-3 dark:border-stone-800 dark:bg-stone-900"><div class="text-[11px] text-muji-muted">當日蛋白質</div><div class="mt-1 text-base font-bold text-muji-brown dark:text-stone-200">${cal.totalProtein !== null ? cal.totalProtein + ' g' : '未記錄'}</div></div>
           </section>
 
           <section class="rounded-2xl border border-muji-border bg-muji-card p-4 dark:border-stone-800 dark:bg-stone-900">
@@ -1044,16 +1021,33 @@
             <div class="mt-2 flex flex-wrap items-center justify-center gap-4 text-xs text-muji-muted">
               <span class="flex items-center gap-1.5"><span class="inline-block h-0.5 w-4 bg-muji-red"></span>每日攝取 (kcal)</span>
               <span class="flex items-center gap-1.5"><span class="inline-block h-0.5 w-4 border-t-2 border-dashed border-stone-400"></span>每日目標</span>
+              ${state.settings.bmrCalories ? `<span class="flex items-center gap-1.5 font-medium text-amber-600 dark:text-amber-400"><span class="inline-block h-0.5 w-4 border-t-2 border-dashed border-amber-500"></span>基礎代謝 Low Limit (${state.settings.bmrCalories})</span>` : ''}
             </div>
+            ${state.settings.bmrCalories && cal.totalIntake !== null && cal.totalIntake < state.settings.bmrCalories ? `<p class="mt-2 rounded-xl bg-amber-50 px-3 py-2 text-center text-xs font-medium text-amber-800 dark:bg-amber-950/40 dark:text-amber-300">今日攝取 (${cal.totalIntake} kcal) 低於基礎代謝 (${state.settings.bmrCalories} kcal)，記得補充足夠營養。</p>` : ''}
           </section>
 
           ${[['breakfast','早餐'],['lunch','午餐'],['dinner','晚餐'],['other','其他飲食（選填）']].map(([k, lbl]) => {
             const entry = mLog?.[k];
             return `
               <div class="rounded-2xl border border-muji-border bg-muji-card p-4 dark:border-stone-800 dark:bg-stone-900">
-                <div class="mb-2 flex justify-between"><span class="font-bold">${lbl}</span><span class="text-xs font-semibold text-muji-red dark:text-red-300">${entry?.calories !== null && entry?.calories !== undefined ? entry.calories + ' kcal' : '未記錄'}</span></div>
-                <textarea rows="2" data-dfood="${k}" placeholder="自由輸入吃了什麼" class="mb-2 w-full rounded-xl border border-muji-border bg-muji-soft px-3 py-2 text-sm dark:border-stone-700 dark:bg-stone-800">${escHtml(entry?.food ?? '')}</textarea>
-                <div class="flex items-center justify-end gap-2 text-xs"><span>熱量 (kcal)：</span><input type="number" inputmode="numeric" data-dcal="${k}" value="${entry?.calories ?? ''}" placeholder="未記錄" class="w-28 rounded-xl border border-muji-border bg-muji-soft px-3 py-1.5 text-right text-sm dark:border-stone-700 dark:bg-stone-800" /></div>
+                <div class="mb-2 flex justify-between">
+                  <span class="font-bold">${lbl}</span>
+                  <span class="text-xs font-semibold text-muji-red dark:text-red-300">
+                    ${entry?.calories !== null && entry?.calories !== undefined ? entry.calories + ' kcal' : '未記錄'}
+                    ${entry?.protein !== null && entry?.protein !== undefined ? ' • ' + entry.protein + ' g' : ''}
+                  </span>
+                </div>
+                <textarea rows="2" data-dfood="${k}" placeholder="自由輸入吃了什麼" class="mb-2.5 w-full rounded-xl border border-muji-border bg-muji-soft px-3 py-2 text-sm dark:border-stone-700 dark:bg-stone-800">${escHtml(entry?.food ?? '')}</textarea>
+                <div class="grid grid-cols-2 gap-2 text-xs">
+                  <label class="flex items-center justify-between gap-1.5 rounded-xl border border-muji-border bg-muji-soft px-2.5 py-1.5 dark:border-stone-700 dark:bg-stone-800">
+                    <span class="shrink-0 text-muji-muted">熱量</span>
+                    <input type="number" inputmode="numeric" data-dcal="${k}" value="${entry?.calories ?? ''}" placeholder="kcal" class="min-w-0 w-full bg-transparent text-right text-sm font-medium focus:outline-none" />
+                  </label>
+                  <label class="flex items-center justify-between gap-1.5 rounded-xl border border-muji-border bg-muji-soft px-2.5 py-1.5 dark:border-stone-700 dark:bg-stone-800">
+                    <span class="shrink-0 text-muji-muted">蛋白質</span>
+                    <input type="number" inputmode="decimal" step="0.1" data-dpro="${k}" value="${entry?.protein ?? ''}" placeholder="g" class="min-w-0 w-full bg-transparent text-right text-sm font-medium focus:outline-none" />
+                  </label>
+                </div>
               </div>
             `;
           }).join('')}
@@ -1063,16 +1057,29 @@
       document.querySelectorAll('[data-drange]').forEach(b => b.addEventListener('click', () => { state.dietRange = b.dataset.drange; render(); }));
       document.querySelectorAll('[data-dfood]').forEach(el => el.addEventListener('change', (e) => saveMealField(d, el.dataset.dfood, 'food', e.target.value)));
       document.querySelectorAll('[data-dcal]').forEach(el => el.addEventListener('change', (e) => saveMealField(d, el.dataset.dcal, 'calories', e.target.value)));
+      document.querySelectorAll('[data-dpro]').forEach(el => el.addEventListener('change', (e) => saveMealField(d, el.dataset.dpro, 'protein', e.target.value)));
 
-      const dBounds = computeOptimalYBounds([...intakeSeries, ...targetSeries], true, 200);
+      const bmr = state.settings.bmrCalories;
+      const dDatasets = [
+        { label: '每日攝取 (kcal)', data: intakeSeries, borderColor: '#8B3A34', backgroundColor: 'rgba(139,58,52,0.10)', fill: true, spanGaps: false, tension: 0.25, pointRadius: 4 },
+        { label: '每日目標', data: targetSeries, borderColor: '#9C8F82', borderDash: [5, 5], pointRadius: 0, borderWidth: 1.5 }
+      ];
+      if (bmr) {
+        dDatasets.push({
+          label: '基礎代謝 Low Limit',
+          data: dDates.map(() => bmr),
+          borderColor: '#EA580C',
+          borderDash: [4, 4],
+          pointRadius: 0,
+          borderWidth: 2.2
+        });
+      }
+      const dBounds = computeOptimalYBounds([...intakeSeries, ...targetSeries, ...(bmr ? [bmr] : [])], true, 200);
       mountStockChart('diet-yaxis', 'd-chart-scroll', 'diet-intake-chart', 'diet', dDates, state.dietRange, dBounds, {
         type: 'line',
         data: {
           labels: dDates.map(dt => dt.slice(5).replace('-', '/')),
-          datasets: [
-            { label: '每日攝取 (kcal)', data: intakeSeries, borderColor: '#8B3A34', backgroundColor: 'rgba(139,58,52,0.10)', fill: true, spanGaps: false, tension: 0.25, pointRadius: 4 },
-            { label: '每日目標', data: targetSeries, borderColor: '#9C8F82', borderDash: [5, 5], pointRadius: 0, borderWidth: 1.5 }
-          ]
+          datasets: dDatasets
         },
         options: { responsive: true, maintainAspectRatio: false, interaction: { mode: 'index', intersect: false }, plugins: { legend: { position: 'bottom' } } }
       });
@@ -1096,6 +1103,9 @@
               <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
                 <label class="block min-w-0">目標日期 (年/月/日)<div class="mt-1">${renderDatePicker('set-targd', s.targetDate ?? '')}</div></label>
                 <label class="block min-w-0">每日熱量目標 (kcal)<input type="number" inputmode="numeric" id="set-cal" value="${s.dailyCalorieTarget}" class="mt-1 w-full rounded-xl border border-muji-border bg-muji-soft px-3 py-2 text-sm dark:border-stone-700 dark:bg-stone-800" /></label>
+              </div>
+              <div class="grid grid-cols-1 gap-3">
+                <label class="block min-w-0">基礎代謝 (kcal)<input type="number" inputmode="numeric" id="set-bmr" placeholder="例如 1300" value="${s.bmrCalories ?? ''}" class="mt-1 w-full rounded-xl border border-muji-border bg-muji-soft px-3 py-2 text-sm dark:border-stone-700 dark:bg-stone-800" /></label>
               </div>
               <button type="submit" class="w-full rounded-xl bg-muji-red py-3 text-sm font-semibold text-white hover:bg-muji-redHover">儲存目標設定</button>
             </form>
@@ -1137,6 +1147,7 @@
           targetWeight: document.getElementById('set-targw').value.trim() ? Number(document.getElementById('set-targw').value) : null,
           targetDate: document.getElementById('set-targd').value.trim() || null,
           dailyCalorieTarget: Math.max(800, Math.round(Number(document.getElementById('set-cal').value) || 1800)),
+          bmrCalories: document.getElementById('set-bmr').value.trim() ? Math.max(500, Math.round(Number(document.getElementById('set-bmr').value))) : null,
           updatedAt: new Date().toISOString()
         };
         await db.settings.put(next); await loadAllData(); render(); showToast('設定已儲存');
